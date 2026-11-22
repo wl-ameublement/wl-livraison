@@ -962,6 +962,8 @@
       const day = getDay(s.dayId);
       const fields = Object.assign({}, s, { delivered: false, failed: false, eta: null, deletedAt: null, duration: 15 });
       delete fields.id;
+       // v19 : place the copy at the end of the day.
+       fields.position = getDayStops(day.id).length;       
       const copy = newStop(day, fields);
       const srcPhotos = DB().photos[s.id] || [];
       if (srcPhotos.length) DB().photos[copy.id] = srcPhotos.map((p) => ({ id: uid(), dataUrl: p.dataUrl, ts: p.ts || Date.now() }));
@@ -1234,7 +1236,12 @@
       btn.addEventListener("click", () => {
         // v13 : re-résoudre dans la base courante (même raison qu'à trashDay)
         const cs = getStop(s.id); if (!cs) { renderTrash(); return; }
-        cs.deletedAt = null;
+        // v19 : if the position is taken, move the restored stop to the end.
+         const liveStops = getDayStops(cs.dayId);
+         if (liveStops.some((x) => (x.position || 0) === (cs.position || 0))) {
+            cs.position = liveStops.reduce((m, x) => Math.max(m, x.position || 0), -1) + 1;
+         }
+         cs.deletedAt = null;
         const cd = getDay(cs.dayId);
         if (cd && cd.deletedAt) cd.deletedAt = null;
         window.Store.saveNow();
