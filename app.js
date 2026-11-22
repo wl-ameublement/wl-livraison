@@ -970,11 +970,22 @@
       openStop(copy.id);
     });
     on("#btnDeleteStop", "click", () => {
-      const s = curStop(); if (!s) return;
+      const s0 = curStop(); if (!s0) return;
       // v9 : confirmation DANS l'app, comme pour les journées — le
       // confirm() natif rendait ce bouton inopérant.
       actionSheet("Mettre cet arrêt à la corbeille ? (récupérable pendant 30 jours dans Réglages)", [
         { label: "Oui, mettre à la corbeille", danger: true, fn: () => {
+          // v18 : re-résoudre dans la base COURANTE (patron v13 de
+          // trashDay et de la restauration) — l'objet capturé à
+          // l'ouverture de la feuille peut être ORPHELIN si un
+          // rechargement serveur a reconstruit la base entre
+          // l'affichage et la confirmation (un rechargement déjà en
+          // vol n'est pas arrêté par le report de l'éditeur) : la
+          // suppression visait alors un objet mort, rien n'entrait
+          // dans le suivi « sale », l'app affichait « ✓
+          // Synchronisé »… et l'arrêt revenait au cycle suivant
+          // (échec corbeille du rodage v17).
+          const s = getStop(s0.id); if (!s) return;
           s.deletedAt = Date.now();
           getDayStops(s.dayId).forEach((x, i) => { x.position = i; });
           touch();

@@ -175,43 +175,65 @@
      sinon celle qui a des photos ; les photos des copies retirées
      sont déplacées sur la copie gardée, puis les positions sont
      renumérotées. Les arrêts encore vides (aucune adresse, aucun
-     client, aucun appareil) ne sont jamais fusionnés. */
+     client, aucun appareil) ne sont jamais fusionnés.
+     v18 : PÉRIMÈTRE RÉDUIT — voir la règle dure dans la fonction :
+     seuls les résidus à ancien identifiant local (non-UUID) sont
+     encore fusionnés ; un arrêt UUID n'est jamais retiré ici. */
   function dedupeStops() {
     if (!DB || !Array.isArray(DB.stops)) return;
     const seen = {};
     const dropped = new Set();
     const score = (s) => (uuidOk(s.id) ? 2 : 0) + ((DB.photos[s.id] || []).length ? 1 : 0);
+    const movePhotos = (fromStop, toStop) => {
+      const from = DB.photos[fromStop.id] || [];
+      if (!from.length) return;
+      const target = DB.photos[toStop.id] || (DB.photos[toStop.id] = []);
+      const urls = new Set(target.map((p) => p.dataUrl));
+      from.forEach((p) => { if (!urls.has(p.dataUrl)) { target.push(p); urls.add(p.dataUrl); } });
+      delete DB.photos[fromStop.id];
+    };
     [...DB.stops].sort((a, b) => score(b) - score(a)).forEach((s) => {
       if (!(s.addressKey || s.client || s.appliance)) return;
       // v9 : les copies SUPPRIMÉES sont fusionnées aussi (groupe à
       // part) — avant, elles s'accumulaient dans la corbeille à
       // chaque cycle suppression/restauration.
-      // v17 : la POSITION et l'ETA font partie de la clé. Une copie
-      // DÉLIBÉRÉE (bouton « Dupliquer ») reçoit la position de fin
-      // de journée et un eta vierge : elle n'est donc plus confondue
-      // avec son original, fusionnée et EFFACÉE AU SERVEUR à chaque
-      // rechargement (bug (e) du rodage v16). Seuls les vrais clones
-      // fantômes de l'ancien bug — même position, même eta, même
-      // contenu — sont encore fusionnés.
+      // v18 : RÈGLE DURE — un arrêt à identifiant UUID n'est JAMAIS
+      // fusionné ni retiré ici, et plus RIEN n'est effacé au serveur
+      // depuis cette fonction. Le rodage v17 l'a prouvé deux fois :
+      // une copie DÉLIBÉRÉE (bouton « Dupliquer ») partage la
+      // position de son original (app.js la copie telle quelle) et,
+      // tant que la journée n'est pas optimisée, son eta est aussi
+      // vide des deux côtés — la clé devenait IDENTIQUE à celle de
+      // l'original, la copie était fusionnée puis EFFACÉE AU
+      // SERVEUR au rechargement suivant, y compris par le
+      // rechargement d'un AUTRE onglet/appareil qui ne la
+      // connaissait pas. Or le contenu seul ne distingue PAS une
+      // duplication délibérée d'un clone fantôme de l'ancien bug :
+      // entre un doublon affiché et une donnée perdue, la donnée
+      // gagne. La multiplication fantôme d'origine (identifiants
+      // locaux non-UUID réinsérés à chaque poussée) est morte
+      // depuis la v8 (UUID + adoption d'id) ; ne sont donc encore
+      // fusionnés que les résidus à ANCIEN identifiant local, dans
+      // un jumeau gardé — jamais l'inverse, jamais au serveur.
       const k = [s.deletedAt ? "del" : "live", s.dayId, s.position || 0, s.eta == null ? "" : s.eta, s.addressKey || "", s.client || "", s.appliance || "", s.phone || ""].join("|");
-      if (!seen[k]) { seen[k] = s; return; }
-      const keeper = seen[k];
-      const from = DB.photos[s.id] || [];
-      if (from.length) {
-        const target = DB.photos[keeper.id] || (DB.photos[keeper.id] = []);
-        const urls = new Set(target.map((p) => p.dataUrl));
-        from.forEach((p) => { if (!urls.has(p.dataUrl)) { target.push(p); urls.add(p.dataUrl); } });
-        delete DB.photos[s.id];
+      const prev = seen[k];
+      if (!prev) { seen[k] = s; return; }
+      if (uuidOk(s.id)) {
+        if (!uuidOk(prev.id)) { // le gardé était un résidu local : le vrai (UUID) prend sa place
+          movePhotos(prev, s);
+          dropped.add(prev.id);
+          seen[k] = s;
+        }
+        return; // deux copies UUID : on garde les deux, toujours
       }
+      movePhotos(s, prev);
       dropped.add(s.id);
     });
     if (dropped.size) {
-      // v9 : effacer pour de bon les copies en trop côté serveur,
-      // sinon le prochain rechargement les ramène toutes.
-      dropped.forEach((id) => { if (uuidOk(id)) deleteRemote("stops", id); });
-      // v17 : les ids retirés sortent aussi du suivi de synchro
-      // (leurs photos vivent maintenant sur la copie gardée, dont
-      // l'empreinte changera et qui sera repoussée au besoin).
+      // v18 : aucun effacement distant ici — les seuls ids retirés
+      // sont des résidus locaux (non-UUID) qui n'existent pas au
+      // serveur ; leurs photos vivent sur la copie gardée.
+      // v17 : les ids retirés sortent aussi du suivi de synchro.
       dropped.forEach((id) => { dirtyStops.delete(id); dirtyPhotoStops.delete(id); cleanStops.delete(id); cleanPhotos.delete(id); });
       DB.stops = DB.stops.filter((s) => !dropped.has(s.id));
       const byDay = {};
@@ -429,10 +451,23 @@
         // encore et encore). Une copie serveur SUPPRIMÉE compte aussi
         // comme doublon : une suppression faite ailleurs gagne, la
         // copie locale ne ressuscite pas l'arrêt.
-        const dup = next.stops.some((x) => x.dayId === target.id &&
-          x.addressKey === s.addressKey && x.client === s.client &&
-          x.appliance === s.appliance && x.phone === s.phone);
-        if (dup) return;
+        // v18 : MAIS seulement pour les anciens identifiants LOCAUX
+        // (non-UUID) — le seul cas où un jumeau serveur peut exister
+        // sous un autre id (adoption d'id de l'ère pré-v8). Un arrêt
+        // à id UUID inconnu du serveur est une création locale pas
+        // encore poussée : le rodage v17 a montré qu'une DUPLICATION
+        // faite pendant les lectures d'un rechargement en vol était
+        // écartée ici (elle « ressemble » à son original par
+        // construction), puis son entrée « sale » était effacée en
+        // silence par la poussée suivante — copie perdue, « ✓
+        // Synchronisé » affiché. Règle v18 : un UUID local n'est
+        // JAMAIS écarté pour ressemblance ; la poussée le créera.
+        if (!uuidOk(s.id)) {
+          const dup = next.stops.some((x) => x.dayId === target.id &&
+            x.addressKey === s.addressKey && x.client === s.client &&
+            x.appliance === s.appliance && x.phone === s.phone);
+          if (dup) return;
+        }
         if (target.id !== s.dayId) s = Object.assign({}, s, { dayId: target.id });
         next.stops.push(s);
       });
