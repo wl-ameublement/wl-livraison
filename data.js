@@ -72,7 +72,21 @@
      MODE LOCAL — persistance immédiate + copies automatiques
      ================================================================ */
   function persistLocal() {
-    try { localStorage.setItem(LS_KEY, JSON.stringify(DB)); } catch (e) { warnQuota(e); }
+    try { localStorage.setItem(LS_KEY, JSON.stringify(DB)); } catch (e) {
+      // v17 : si le stockage est plein, réessayer SANS les photos
+      // déjà confirmées par le serveur (elles y sont en sécurité) —
+      // seules les photos « sales » (pas encore rendues) restent sur
+      // l'appareil. Avant, l'échec était silencieux et la copie
+      // locale restait figée à un vieil état.
+      try {
+        const light = Object.assign({}, DB, { photos: {} });
+        Object.keys(DB.photos || {}).forEach((sid) => {
+          if (dirtyPhotoStops.has(sid)) light.photos[sid] = DB.photos[sid];
+        });
+        localStorage.setItem(LS_KEY, JSON.stringify(light));
+      } catch (e2) { /* même allégée, ça ne rentre pas : le serveur et les ensembles sales persistés prennent le relais */ }
+      warnQuota(e);
+    }
     // Copie de secours automatique, réécrite à chaque changement.
     // v13 : SANS les photos (elles sont dans la copie principale et
     // sur Supabase) — ça divise l'empreinte locale et repousse
@@ -172,7 +186,14 @@
       // v9 : les copies SUPPRIMÉES sont fusionnées aussi (groupe à
       // part) — avant, elles s'accumulaient dans la corbeille à
       // chaque cycle suppression/restauration.
-      const k = [s.deletedAt ? "del" : "live", s.dayId, s.addressKey || "", s.client || "", s.appliance || "", s.phone || ""].join("|");
+      // v17 : la POSITION et l'ETA font partie de la clé. Une copie
+      // DÉLIBÉRÉE (bouton « Dupliquer ») reçoit la position de fin
+      // de journée et un eta vierge : elle n'est donc plus confondue
+      // avec son original, fusionnée et EFFACÉE AU SERVEUR à chaque
+      // rechargement (bug (e) du rodage v16). Seuls les vrais clones
+      // fantômes de l'ancien bug — même position, même eta, même
+      // contenu — sont encore fusionnés.
+      const k = [s.deletedAt ? "del" : "live", s.dayId, s.position || 0, s.eta == null ? "" : s.eta, s.addressKey || "", s.client || "", s.appliance || "", s.phone || ""].join("|");
       if (!seen[k]) { seen[k] = s; return; }
       const keeper = seen[k];
       const from = DB.photos[s.id] || [];
@@ -188,6 +209,10 @@
       // v9 : effacer pour de bon les copies en trop côté serveur,
       // sinon le prochain rechargement les ramène toutes.
       dropped.forEach((id) => { if (uuidOk(id)) deleteRemote("stops", id); });
+      // v17 : les ids retirés sortent aussi du suivi de synchro
+      // (leurs photos vivent maintenant sur la copie gardée, dont
+      // l'empreinte changera et qui sera repoussée au besoin).
+      dropped.forEach((id) => { dirtyStops.delete(id); dirtyPhotoStops.delete(id); cleanStops.delete(id); cleanPhotos.delete(id); });
       DB.stops = DB.stops.filter((s) => !dropped.has(s.id));
       const byDay = {};
       DB.stops.filter((s) => !s.deletedAt).forEach((s) => { (byDay[s.dayId] = byDay[s.dayId] || []).push(s); });
@@ -254,9 +279,10 @@
     const { data, error } = await supa.auth.signInWithPassword({ email, password });
     if (error) throw error;
     supaUser = data.user;
-    loadShadow();
-    // v16 : pousser d'abord ce que l'appareil a et que le serveur
-    // n'a pas, puis recharger — jamais l'inverse.
+    loadSyncMeta();
+    recomputeDirty();
+    // v17 : pousser d'abord ce que l'appareil a et que le serveur
+    // n'a pas confirmé, puis recharger — jamais l'inverse.
     if (hasLocalDiff()) await pushSupabaseNowInner();
     await reloadFromSupabase();
     subscribeRealtime();
@@ -264,7 +290,6 @@
   }
 
   async function reloadFromSupabase() {
-    const prevShadow = serverShadow; // v16 : ombre d'AVANT ce rechargement (pour la surcouche, plus bas)
     const [daysR, stopsR, photosR, profR, addrR] = await Promise.all([
       supa.from("days").select("*").order("date"),
       supa.from("stops").select("*").order("position"),
@@ -272,6 +297,21 @@
       supa.from("profiles").select("*"),
       supa.from("addresses").select("*") // v16 : en parallèle (avant : un aller-retour de plus en série)
     ]);
+    // v17 : les erreurs de LECTURE sont enfin vérifiées ici. Avant,
+    // un échec (réseau, session expirée) donnait data = null, traité
+    // comme « table vide » : la base reconstruite était vide ou
+    // partielle, puis persistLocal() l'écrivait PAR-DESSUS la copie
+    // locale saine — l'écran se vidait et les données semblaient
+    // perdues au rechargement. Maintenant : on abandonne le
+    // rechargement, la base courante reste en place, l'état passe
+    // en erreur (jamais « ✓ Synchronisé » sur une lecture ratée).
+    if (daysR.error || stopsR.error || photosR.error || addrR.error) {
+      console.warn("Rechargement Supabase abandonné (lecture en erreur).",
+        daysR.error || stopsR.error || photosR.error || addrR.error);
+      setSyncState("error");
+      scheduleSyncRetry();
+      return;
+    }
     const next = emptyDB();
     next.profile = DB ? DB.profile : null;
     next.seeded = DB ? !!DB.seeded : false; // v8 : ne pas reperdre le marqueur à chaque rechargement (la journée démo revenait sans cesse)
@@ -324,10 +364,18 @@
     let fullPhotos = [];
     if (changedStopIds.length) {
       const r = await supa.from("photos").select("*").in("stop_id", changedStopIds);
+      if (r.error) { // v17 : abandonner plutôt que de tronquer les photos
+        console.warn("Rechargement abandonné (photos illisibles).", r.error);
+        setSyncState("error"); scheduleSyncRetry(); return;
+      }
       fullPhotos = r.data || [];
     }
     if (legacyPhotoIds.length) {
       const r = await supa.from("photos").select("*").in("id", legacyPhotoIds);
+      if (r.error) {
+        console.warn("Rechargement abandonné (photos illisibles).", r.error);
+        setSyncState("error"); scheduleSyncRetry(); return;
+      }
       fullPhotos = fullPhotos.concat(r.data || []);
     }
     next.stops.forEach((s) => {
@@ -351,11 +399,11 @@
         if (!arr.some((x) => x.dataUrl === p.data_url)) arr.push(photo);
       });
     });
-    // v15 : ombre serveur = l'état tel que LU, avant les fusions
-    // locales ci-dessous (qui, elles, représentent ce que la
-    // prochaine poussée devra écrire).
-    serverShadow = buildShadow(next.days, next.stops, next.photos, addrR.data || []);
-    persistShadow();
+    // v17 : retenir quelles entités viennent vraiment du serveur
+    // dans cette lecture — à la fin du rechargement, seules celles-là
+    // pourront avancer les empreintes « propres » (voir plus bas).
+    const srvDayDateSet = new Set(next.days.map((d) => d.date));
+    const srvStopIdSet = new Set(next.stops.map((s) => s.id));
     // Préserver ce qui n'existe encore que sur cet appareil (créé hors
     // connexion ou pas encore poussé) : sans ça, le rechargement serveur
     // l'effacerait de l'écran — et de l'appareil — en silence.
@@ -420,28 +468,14 @@
         if (l && d.routeMin == null && l.routeMin != null) {
           d.routeMin = l.routeMin; d.routeKm = l.routeKm; d.returnMin = l.returnMin;
         }
-        // v10 : une confirmation de trajet faite sur l'appareil
-        // mais pas encore rendue au serveur (rechargement trop
-        // rapide) reste confirmée — la confirmation est un geste
-        // délibéré, elle ne se perd pas.
-        if (l && l.status === "confirmed" && d.status !== "confirmed") d.status = "confirmed";
-        // v11 : corbeille — l'état local gagne (voir plus bas).
-        if (l && (l.deletedAt == null) !== (d.deletedAt == null)) d.deletedAt = l.deletedAt;
       });
-      // v11 : pour la CORBEILLE (deletedAt), l'état LOCAL gagne
-      // toujours sur le serveur, journées comme arrêts : une
-      // suppression ou une restauration faite sur l'appareil mais
-      // pas encore rendue au serveur (page rechargée trop vite,
-      // poussée interrompue) ne doit pas être annulée par le
-      // rechargement — cas vus au retest v10 : journée recréée
-      // disparue, première restauration annulée. La poussée
-      // suivante rend l'état local au serveur.
-      const localStopById = {};
-      (DB.stops || []).forEach((s) => { localStopById[s.id] = s; });
-      next.stops.forEach((s) => {
-        const l = localStopById[s.id];
-        if (l && (l.deletedAt == null) !== (s.deletedAt == null)) s.deletedAt = l.deletedAt;
-      });
+      // v17 : les anciens hacks « l'état local gagne » (v10 statut
+      // confirmé, v11 corbeille) sont RETIRÉS — ils corrigeaient
+      // TOUTES les entités, y compris celles que le serveur avait
+      // à jour, et masquaient les vraies pertes. Ils sont remplacés
+      // par la surcouche ciblée des entités « sales » ci-dessous,
+      // qui ne protège que ce qui n'a pas été confirmé par le
+      // serveur.
     }
     // v10 : un arrêt dont la JOURNÉE est supprimée est supprimé
     // aussi, même si sa propre ligne serveur n'a pas encore son
@@ -450,64 +484,63 @@
     // non), puis recréation immédiate de la journée = les arrêts
     // « ressuscitaient ». La restauration depuis la corbeille
     // relève journée ET arrêts explicitement : pas touchée.
-    // (Appliqué APRÈS la priorité locale v11, pour ne pas écraser
-    // une restauration en cours.)
+    // (Appliqué AVANT la surcouche des entités « sales » ci-dessous,
+    // pour ne pas écraser une restauration en cours.)
     const deletedDayById = {};
     next.days.forEach((d) => { if (d.deletedAt) deletedDayById[d.id] = d.deletedAt; });
     next.stops.forEach((s) => {
       if (!s.deletedAt && deletedDayById[s.dayId]) s.deletedAt = deletedDayById[s.dayId];
     });
-    // v16 : SURCOUCHE DES MODIFICATIONS LOCALES NON POUSSÉES.
-    // Une entité dont la forme locale diffère de l'ombre d'AVANT
-    // ce rechargement (prevShadow) porte un changement jamais
-    // rendu au serveur (poussée interrompue par un rechargement
-    // de page, réseau coupé...) : sa forme locale gagne dans la
-    // base fusionnée, et la poussée qui suit l'envoie. Une entité
-    // locale ÉGALE à prevShadow était propre : le serveur gagne
-    // (il a pu bouger depuis un autre appareil). C'est le
-    // correctif central de la v16 — avant, TOUT rechargement
-    // (y compris celui du démarrage) écrasait les modifications
-    // locales pas encore poussées : positions optimisées,
-    // téléphone, détails et suppressions perdus au rodage v15.
-    if (DB && prevShadow) {
-      const srvDayIdByDate = {};
-      next.days.forEach((d) => { srvDayIdByDate[d.date] = d.id; });
-      const addrIdByKey3 = {};
-      (addrR.data || []).forEach((a) => { addrIdByKey3[a.address_key] = a.id; });
-      let dirtyFound = false;
+    // v17 : SURCOUCHE DES ENTITÉS « SALES ». Une entité présente
+    // dans les ensembles « sales » persistés (modifiée localement,
+    // jamais confirmée par une écriture VÉRIFIÉE — voir le suivi
+    // explicite plus bas) garde sa forme locale dans la base
+    // fusionnée ; tout le reste vient du serveur. Contrairement à
+    // la surcouche v16, la décision ne dépend plus d'une
+    // comparaison d'ombre reconstruite (qui pouvait déclarer
+    // « propre » une entité que le serveur n'avait jamais reçue),
+    // mais d'un fait enregistré au moment de la modification et
+    // effacé seulement après vérification.
+    if (DB) {
       (DB.days || []).forEach((ld) => {
+        if (!dirtyDays.has(ld.date)) return;
         const nd = next.days.find((d) => d.date === ld.date);
         if (!nd) return; // inconnue du serveur : préservée plus haut
-        if (prevShadow.days.get(ld.date) !== shadowDayJSON(ld)) {
-          nd.status = ld.status; nd.optimized = ld.optimized; nd.deletedAt = ld.deletedAt;
-          dirtyFound = true;
-        }
+        nd.status = ld.status; nd.optimized = ld.optimized; nd.deletedAt = ld.deletedAt;
+        if (ld.routeMin != null) { nd.routeMin = ld.routeMin; nd.routeKm = ld.routeKm; nd.returnMin = ld.returnMin; }
       });
       (DB.stops || []).forEach((ls) => {
+        if (!dirtyStops.has(ls.id)) return;
         const ns = next.stops.find((s) => s.id === ls.id);
         if (!ns) return; // inconnu du serveur : préservé plus haut
-        const lDay = (DB.days || []).find((d) => d.id === ls.dayId);
-        const srvDayId = (lDay && srvDayIdByDate[lDay.date]) || ns.dayId;
-        const localJSON = stopShadowJSON(ls, srvDayId, addrIdByKey3[ls.addressKey] || null);
-        if (prevShadow.stops.get(ls.id) !== localJSON) {
-          const keepDayId = ns.dayId;
-          Object.assign(ns, ls, { id: ns.id, dayId: keepDayId });
-          delete ns._addressId;
-          if (DB.photos && DB.photos[ls.id]) next.photos[ns.id] = DB.photos[ls.id].slice();
-          dirtyFound = true;
-        }
+        const keepDayId = ns.dayId;
+        Object.assign(ns, ls, { id: ns.id, dayId: keepDayId });
+        delete ns._addressId;
       });
-      if (dirtyFound) unpushedChanges = true;
+      Object.keys(DB.photos || {}).forEach((sid) => {
+        if (!dirtyPhotoStops.has(sid)) return;
+        next.photos[sid] = (DB.photos[sid] || []).slice();
+      });
     }
     DB = next;
     dedupeDays();
     dedupeStops();
-    // v16 : la copie locale reflète TOUJOURS la base fusionnée —
-    // sinon, au prochain démarrage, une vieille copie locale
-    // serait prise pour un changement local et écraserait le
-    // serveur (le piège inverse).
+    // v17 : recalculer les ensembles « sales » contre les
+    // empreintes « propres » AVANT d'avancer celles-ci — une photo
+    // locale absorbée par la fusion ci-dessus (jamais rendue au
+    // serveur) doit rester « sale », pas devenir propre par
+    // absorption. Ensuite seulement, les empreintes des entités
+    // venues du serveur et non sales avancent jusqu'à l'état lu.
+    recomputeDirty();
+    refreshCleanFromDB(srvDayDateSet, srvStopIdSet);
+    // La copie locale reflète TOUJOURS la base fusionnée — sinon,
+    // au prochain démarrage, une vieille copie locale serait prise
+    // pour un changement local et écraserait le serveur.
     persistLocal();
-    if (unpushedChanges) pushSupabaseSoon(); // envoyer la surcouche
+    persistSyncMeta();
+    refreshUnpushed();
+    if (unpushedChanges) { setSyncState("pending"); pushSupabaseSoon(); } // envoyer la surcouche
+    else setSyncState("ok");
   }
 
   function t2m(t) { // "10:30:00" -> 630
@@ -541,21 +574,42 @@
      rechargement commence par POUSSER ce qui est en attente. */
   let unpushedChanges = false;
 
-  /* v15 : OMBRE SERVEUR + POUSSÉES DIFFÉRENTIELLES.
-     Constat du diagnostic du 21 nov. (inspection directe des
-     tables) : pas de journées en double au serveur, mais des
-     corruptions d'état (statut « confirmé » et positions d'une
-     journée revenus en arrière) causées par des instances de
-     l'app restées ouvertes (anciens onglets/fenêtres) dont la
-     mémoire était périmée : chaque poussée réécrivait TOUTE la
-     base, donc un onglet périmé qui sauvegardait n'importe quoi
-     écrasait les données fraîches du serveur. Correctif : on
-     garde une « ombre » de l'état serveur connu (lue au
-     rechargement, ou écrite par la dernière poussée réussie) et
-     la poussée ne réécrit QUE les entités différentes de
-     l'ombre. Un onglet périmé ne peut plus écraser ce qu'il n'a
-     pas touché. */
-  let serverShadow = null;
+  /* v17 : SUIVI EXPLICITE DES ENTITÉS « SALES » (remplace l'ombre
+     serveur des v15-v16).
+     Diagnostic du rodage v16 (22 nov.) : les CRÉATIONS passaient,
+     mais TOUTE modification d'une donnée existante (champ édité,
+     optimisation, corbeille, duplication, photos) était perdue au
+     rechargement alors que l'en-tête affichait « ✓ Synchronisé ».
+     Mécanisme : les upserts de la poussée partaient SANS .select()
+     — une écriture que le serveur n'appliquait pas ne produisait
+     donc aucune erreur visible ; malgré ça, rebuildShadowFromDB()
+     avançait l'« ombre » jusqu'à l'état local et l'état passait à
+     « ok ». Dès lors, la différence avait disparu des deux côtés :
+     les poussées suivantes sautaient l'entité (« égale à l'ombre »)
+     et le rechargement ramenait la valeur du serveur. Perte
+     permanente ET invisible. Aggravants : l'ombre persistée
+     gardait une 2e copie de toutes les photos en base64
+     (localStorage saturé — bannière « stockage presque plein »
+     vue au rodage) et dedupeStops() effaçait au serveur les
+     duplications délibérées (voir plus bas).
+     Nouveau principe, plus simple et vérifiable :
+     - chaque entité modifiée entre dans un ensemble « sale »
+       PERSISTÉ (dirtyDays par date, dirtyStops et dirtyPhotoStops
+       par id d'arrêt), calculé par empreintes dans save() ;
+     - la poussée n'écrit QUE les entités sales, et chaque écriture
+       est VÉRIFIÉE par les lignes retournées (.select()) comparées
+       aux valeurs envoyées ; les photos sont relues et leurs
+       ensembles d'URLs comparés ;
+     - un id ne sort de l'ensemble sale QU'APRÈS cette vérification,
+       et seulement si son empreinte n'a pas changé pendant la
+       poussée ;
+     - tout écart = exception = état « error », ensembles conservés,
+       nouvel essai automatique. « ✓ Synchronisé » ne s'affiche que
+       lorsque les ensembles sales sont vides après un cycle vérifié.
+     Les empreintes utilisent des clés STABLES (date de journée,
+     clé d'adresse) plutôt que les identifiants serveur, et les
+     photos sont empreintées par hachage — jamais de base64 dans
+     l'état de synchro. */
   function dayRowOf(d) {
     return {
       id: uuidOk(d.id) ? d.id : undefined, date: d.date,
@@ -586,93 +640,120 @@
   function addrCmpOf(r) {
     return JSON.stringify({ full_address: r.full_address, street: r.street, city: r.city, sector: r.sector, postal_code: r.postal_code, lat: r.lat, lng: r.lng });
   }
-  function shadowDayJSON(d) {
-    return JSON.stringify({ id: d.id, status: d.status, optimized: !!d.optimized, deleted_ms: d.deletedAt || null });
+  /* v17 : EMPREINTES des entités, pour le suivi « propre / sale ».
+     Une empreinte décrit le contenu SYNCHRONISABLE d'une entité
+     avec des clés stables : la journée est repérée par sa DATE et
+     l'adresse par sa CLÉ (jamais par les identifiants serveur, qui
+     peuvent être adoptés/remplacés sans que le contenu change). */
+  function dayFP(d) {
+    return JSON.stringify({ status: d.status, optimized: !!d.optimized, deleted_ms: d.deletedAt || null });
   }
-  function stopShadowJSON(s, dayId, addressId) {
-    const r = stopRowOf(s, dayId, addressId);
-    r.deleted_at = s.deletedAt || null; // comparer en ms, pas en texte ISO (le format serveur diffère)
+  function stopFP(s) {
+    const day = ((DB && DB.days) || []).find((d) => d.id === s.dayId);
+    const r = stopRowOf(s, day ? day.date : s.dayId, null);
+    r.day_id = day ? day.date : (s.dayId || null); // la DATE (stable), pas l'id serveur
+    r.address_id = s.addressKey || null;          // la CLÉ d'adresse (stable), pas l'id serveur
+    r.deleted_at = s.deletedAt || null;           // comparer en ms des deux côtés
     return JSON.stringify(r);
   }
-  function buildShadow(days, stops, photos, addrRows) {
-    const sh = { days: new Map(), stops: new Map(), addrs: new Map(), addrIds: new Map(), photos: new Map() };
-    const addrIdByKey = {};
-    (addrRows || []).forEach((a) => {
-      sh.addrs.set(a.address_key, addrCmpOf(a));
-      sh.addrIds.set(a.address_key, a.id);
-      addrIdByKey[a.address_key] = a.id;
-    });
-    (days || []).forEach((d) => { sh.days.set(d.date, shadowDayJSON(d)); });
-    (stops || []).forEach((s) => { sh.stops.set(s.id, stopShadowJSON(s, s.dayId, addrIdByKey[s.addressKey] || null)); });
-    Object.keys(photos || {}).forEach((sid) => {
-      sh.photos.set(sid, new Set((photos[sid] || []).map((p) => p.dataUrl)));
-    });
-    return sh;
+  function hashStr(str) { // cyrb53 — empreinte courte d'une photo (jamais le base64 lui-même)
+    let h1 = 0xdeadbeef, h2 = 0x41c6ce57;
+    for (let i = 0; i < str.length; i++) {
+      const ch = str.charCodeAt(i);
+      h1 = Math.imul(h1 ^ ch, 2654435761);
+      h2 = Math.imul(h2 ^ ch, 1597334677);
+    }
+    h1 = Math.imul(h1 ^ (h1 >>> 16), 2246822507) ^ Math.imul(h2 ^ (h2 >>> 13), 3266489909);
+    h2 = Math.imul(h2 ^ (h2 >>> 16), 2246822507) ^ Math.imul(h1 ^ (h1 >>> 13), 3266489909);
+    return (h2 >>> 0).toString(16) + (h1 >>> 0).toString(16) + ":" + str.length;
   }
-  function rebuildShadowFromDB(dayIdByDate) {
-    // Après une poussée réussie : l'ombre devient l'état qu'on
-    // vient d'écrire (identifiants serveur résolus).
-    const addrRows = [];
-    const seen = {};
-    DB.stops.forEach((s) => {
-      if (s.addressKey && !seen[s.addressKey]) { seen[s.addressKey] = true; addrRows.push(Object.assign(addrRowOf(s), { id: s._addressId || null })); }
-    });
-    const daysAsServer = DB.days.map((d) => Object.assign({}, d, { id: dayIdByDate[d.date] || d.id }));
-    const stopsAsServer = DB.stops.map((s) => {
-      const day = DB.days.find((x) => x.id === s.dayId);
-      const copy = Object.assign({}, s);
-      if (day && dayIdByDate[day.date]) copy.dayId = dayIdByDate[day.date];
-      return copy;
-    });
-    serverShadow = buildShadow(daysAsServer, stopsAsServer, DB.photos, addrRows);
-    persistShadow();
+  function photoFP(bucket) {
+    return (bucket || []).map((p) => hashStr(p.dataUrl || "")).sort().join(",");
   }
 
-  /* v16 : l'ombre est PERSISTÉE (localStorage) avec la base. Sans
-     ça, elle mourait à chaque fermeture de page : au redémarrage,
-     impossible de savoir ce qui n'avait jamais été rendu au
-     serveur, et le rechargement initial écrasait les modifications
-     locales pas encore poussées (pertes vues au rodage v15 :
-     positions optimisées, téléphone, détails, corbeille). Avec
-     l'ombre persistée, le démarrage pousse d'abord la différence
-     locale, et la fusion au rechargement garde la forme locale de
-     toute entité qui diffère de l'ombre (voir plus bas). */
-  const LS_SHADOW = "wl_livraison_shadow_v1";
-  function persistShadow() {
-    if (!serverShadow) return;
+  /* v17 : ÉTAT DE SYNCHRO PERSISTÉ (localStorage) : les empreintes
+     « propres » (dernier état CONFIRMÉ par le serveur pour chaque
+     entité) et les ensembles « sales » (entités modifiées depuis).
+     Léger : aucune photo en base64 ici — seulement des empreintes.
+     L'ancienne clé d'ombre v15-v16 est abandonnée (et retirée) :
+     sans empreintes connues, le premier démarrage v17 considère
+     TOUT comme sale — la première poussée vérifiée réécrira tout
+     et établira les empreintes. C'est volontairement conservateur :
+     mieux vaut tout réécrire une fois que perdre une modification. */
+  const LS_SYNC = "wl_livraison_sync_v17";
+  let cleanDays = new Map(), cleanStops = new Map(), cleanPhotos = new Map();
+  let dirtyDays = new Set(), dirtyStops = new Set(), dirtyPhotoStops = new Set();
+  function persistSyncMeta() {
     try {
-      localStorage.setItem(LS_SHADOW, JSON.stringify({
-        days: [...serverShadow.days], stops: [...serverShadow.stops],
-        addrs: [...serverShadow.addrs], addrIds: [...serverShadow.addrIds],
-        photos: [...serverShadow.photos].map(([k, v]) => [k, [...v]])
+      localStorage.setItem(LS_SYNC, JSON.stringify({
+        cleanDays: [...cleanDays], cleanStops: [...cleanStops], cleanPhotos: [...cleanPhotos],
+        dirtyDays: [...dirtyDays], dirtyStops: [...dirtyStops], dirtyPhotoStops: [...dirtyPhotoStops]
       }));
-    } catch (e) { /* l'ombre en mémoire suffit pour la session */ }
+    } catch (e) { /* le filet recomputeDirty() au prochain démarrage rattrape */ }
   }
-  function loadShadow() {
+  function loadSyncMeta() {
+    try { localStorage.removeItem("wl_livraison_shadow_v1"); } catch (e) { /* nettoyage v16 */ }
     try {
-      const raw = localStorage.getItem(LS_SHADOW);
-      if (!raw) { serverShadow = null; return; }
-      const o = JSON.parse(raw);
-      serverShadow = {
-        days: new Map(o.days || []), stops: new Map(o.stops || []),
-        addrs: new Map(o.addrs || []), addrIds: new Map(o.addrIds || []),
-        photos: new Map((o.photos || []).map(([k, v]) => [k, new Set(v)]))
-      };
-    } catch (e) { serverShadow = null; }
+      const o = JSON.parse(localStorage.getItem(LS_SYNC) || "null");
+      if (o) {
+        cleanDays = new Map(o.cleanDays || []); cleanStops = new Map(o.cleanStops || []);
+        cleanPhotos = new Map(o.cleanPhotos || []);
+        dirtyDays = new Set(o.dirtyDays || []); dirtyStops = new Set(o.dirtyStops || []);
+        dirtyPhotoStops = new Set(o.dirtyPhotoStops || []);
+        return;
+      }
+    } catch (e) { /* première fois */ }
+    cleanDays = new Map(); cleanStops = new Map(); cleanPhotos = new Map();
+    dirtyDays = new Set(); dirtyStops = new Set(); dirtyPhotoStops = new Set();
   }
-  function dayDiffers(ld) {
-    if (!serverShadow) return true;
-    return serverShadow.days.get(ld.date) !== shadowDayJSON(ld);
+  function refreshUnpushed() {
+    unpushedChanges = dirtyDays.size + dirtyStops.size + dirtyPhotoStops.size > 0;
   }
-  function stopDiffers(ls) {
-    if (!serverShadow) return true;
-    const addrId = serverShadow.addrIds.get(ls.addressKey) || null;
-    return serverShadow.stops.get(ls.id) !== stopShadowJSON(ls, ls.dayId, addrId);
+  /* Recalcule les ensembles « sales » en comparant chaque entité
+     locale à son empreinte « propre ». Filet de sécurité appelé à
+     chaque sauvegarde et à chaque démarrage : même si un ensemble
+     persisté était perdu, un écart réel est redétecté ici. Un
+     ensemble ne rétrécit JAMAIS ici — seul un cycle de poussée
+     vérifiée retire des ids. */
+  function recomputeDirty() {
+    if (!DB) return;
+    (DB.days || []).forEach((d) => { if (cleanDays.get(d.date) !== dayFP(d)) dirtyDays.add(d.date); });
+    (DB.stops || []).forEach((s) => { if (cleanStops.get(s.id) !== stopFP(s)) dirtyStops.add(s.id); });
+    const photoStopIds = new Set([...Object.keys(DB.photos || {}), ...cleanPhotos.keys()]);
+    photoStopIds.forEach((sid) => {
+      const fp = photoFP((DB.photos || {})[sid]);
+      if (fp === "" && !cleanPhotos.has(sid)) return; // arrêt sans photo jamais poussé : rien à suivre
+      if (cleanPhotos.get(sid) !== fp) dirtyPhotoStops.add(sid);
+    });
+    refreshUnpushed();
+  }
+  /* Après un rechargement : les empreintes « propres » des entités
+     LUES du serveur et NON sales avancent jusqu'à l'état lu (c'est
+     l'état que le serveur vient de confirmer par cette lecture).
+     Les entités absentes de la lecture (préservées localement) et
+     les entités sales gardent leur ancienne empreinte. */
+  function refreshCleanFromDB(srvDayDateSet, srvStopIdSet) {
+    if (!DB) return;
+    (DB.days || []).forEach((d) => {
+      if (srvDayDateSet && !srvDayDateSet.has(d.date)) return;
+      if (!dirtyDays.has(d.date)) cleanDays.set(d.date, dayFP(d));
+    });
+    (DB.stops || []).forEach((s) => {
+      if (srvStopIdSet && !srvStopIdSet.has(s.id)) return;
+      if (!dirtyStops.has(s.id)) cleanStops.set(s.id, stopFP(s));
+      if (!dirtyPhotoStops.has(s.id)) cleanPhotos.set(s.id, photoFP((DB.photos || {})[s.id]));
+    });
+    // Oublier les empreintes d'entités disparues de la base.
+    const dates = new Set((DB.days || []).map((d) => d.date));
+    [...cleanDays.keys()].forEach((k) => { if (!dates.has(k) && !dirtyDays.has(k)) cleanDays.delete(k); });
+    const ids = new Set((DB.stops || []).map((s) => s.id));
+    [...cleanStops.keys()].forEach((k) => { if (!ids.has(k) && !dirtyStops.has(k)) cleanStops.delete(k); });
+    [...cleanPhotos.keys()].forEach((k) => { if (!ids.has(k) && !dirtyPhotoStops.has(k)) cleanPhotos.delete(k); });
   }
   function hasLocalDiff() {
     if (!DB) return false;
-    if (!serverShadow) return (DB.days.length + DB.stops.length) > 0;
-    return DB.days.some(dayDiffers) || DB.stops.some(stopDiffers);
+    recomputeDirty();
+    return unpushedChanges;
   }
 
   /* v16 : état de synchronisation VISIBLE. Avant, l'indicateur
@@ -681,8 +762,13 @@
      croyait ses données en sécurité alors qu'elles ne l'étaient
      pas. Maintenant : pending = poussée en cours, error = le
      serveur n'a pas confirmé (nouvel essai automatique), ok =
-     le serveur a tout reçu. */
-  let syncState = "ok";
+     le serveur a tout reçu.
+     v17 : l'état initial en mode supabase est « pending », PAS
+     « ok » — avant, l'en-tête pouvait afficher « ✓ Synchronisé »
+     dès l'ouverture, avant la moindre vérification. « ok » ne
+     vient maintenant que d'un cycle vérifié (poussée confirmée
+     ou rechargement propre avec ensembles sales vides). */
+  let syncState = MODE === "supabase" ? "pending" : "ok";
   let onSyncState = null;
   function setSyncState(st) {
     if (syncState === st) return;
@@ -709,186 +795,205 @@
   }
   function pushSupabaseNow() { return enqueueOp(pushSupabaseNowInner); }
   async function pushSupabaseNowInner() {
-    if (!supa || !supaUser) { unpushedChanges = false; return; }
+    // v17 : sans session, on ne prétend PLUS que tout est rendu —
+    // les ensembles « sales » restent pleins et l'état reste
+    // « pending »/« error » jusqu'à une vraie vérification.
+    if (!supa || !supaUser) { refreshUnpushed(); return; }
+    recomputeDirty();
+    if (!unpushedChanges) { setSyncState("ok"); return; }
     setSyncState("pending");
+    // Instantané du travail à faire + empreintes au départ : ce qui
+    // changera PENDANT la poussée (autre frappe, autre onglet)
+    // gardera une empreinte différente et restera « sale ».
+    const todoDays = new Set(dirtyDays), todoStops = new Set(dirtyStops), todoPhotos = new Set(dirtyPhotoStops);
+    const fpDay0 = new Map(), fpStop0 = new Map(), fpPhoto0 = new Map();
+    todoDays.forEach((date) => { const d = DB.days.find((x) => x.date === date); if (d) fpDay0.set(date, dayFP(d)); });
+    todoStops.forEach((id) => { const s = DB.stops.find((x) => x.id === id); if (s) fpStop0.set(id, stopFP(s)); });
+    todoPhotos.forEach((sid) => { const s = DB.stops.find((x) => x.id === sid); fpPhoto0.set(sid, photoFP(s ? DB.photos[s.id] : [])); });
+    const adoptedMap = {}; // ancien id local -> id serveur (arrêts hérités)
     try {
-      // Adresses d'abord (les arrêts y font référence)
-      const addrKeys = {};
-      for (const s of DB.stops) {
-        if (!s.addressKey) continue;
-        if (!addrKeys[s.addressKey]) {
-          const row = addrRowOf(s);
-          // v15 : adresse inchangée depuis l'ombre → réutiliser
-          // son identifiant serveur sans réécrire.
-          if (serverShadow && serverShadow.addrs.get(s.addressKey) === addrCmpOf(row) && serverShadow.addrIds.get(s.addressKey)) {
-            addrKeys[s.addressKey] = serverShadow.addrIds.get(s.addressKey);
-          } else {
-            const res = await supa.from("addresses").upsert(row, { onConflict: "address_key" }).select("id,address_key").single();
-            throwIfError("Adresse", res);
-            if (res.data) addrKeys[s.addressKey] = res.data.id;
+      // 1. Adresses des seuls arrêts concernés (les arrêts y font
+      // référence) — upsert VÉRIFIÉ par la ligne retournée.
+      const workStops = DB.stops.filter((s) => todoStops.has(s.id) || todoPhotos.has(s.id));
+      const addrIdByKey = {};
+      for (const s of workStops) {
+        if (!s.addressKey || addrIdByKey[s.addressKey]) continue;
+        const res = await supa.from("addresses").upsert(addrRowOf(s), { onConflict: "address_key" }).select("id,address_key").single();
+        throwIfError("Adresse", res);
+        if (!res.data || !res.data.id) throw new Error("Adresse : écriture non confirmée par le serveur");
+        addrIdByKey[s.addressKey] = res.data.id;
+      }
+      workStops.forEach((s) => { if (s.addressKey) s._addressId = addrIdByKey[s.addressKey]; });
+      // v17 : plus de pré-passage « suppressions d'abord » (v10-v16).
+      // Chaque entité sale est écrite en LIGNE COMPLÈTE, deleted_at
+      // compris, et vérifiée — une suppression est une modification
+      // comme une autre, ni plus ni moins protégée.
+      // 2. Journées sales — lot unique, VÉRIFIÉ ligne par ligne :
+      // chaque ligne retournée doit porter exactement les valeurs
+      // envoyées (statut, optimisé, corbeille). C'est LE correctif
+      // central de la v17 : avant, l'upsert partait sans .select()
+      // et une écriture non appliquée passait pour un succès.
+      const dayRows = [];
+      for (const date of todoDays) {
+        const d = DB.days.find((x) => x.date === date);
+        if (d) dayRows.push(dayRowOf(d)); else dirtyDays.delete(date); // disparue de la base : plus rien à écrire
+      }
+      if (dayRows.length) {
+        const res = await supa.from("days").upsert(dayRows, { onConflict: "date" }).select("id,date,status,optimized,deleted_at");
+        throwIfError("Journées", res);
+        const back = {};
+        (res.data || []).forEach((r) => { back[r.date] = r; });
+        for (const row of dayRows) {
+          const r = back[row.date];
+          if (!r) throw new Error("Journée " + row.date + " : écriture non confirmée par le serveur");
+          const delSent = row.deleted_at ? Date.parse(row.deleted_at) : null;
+          const delBack = r.deleted_at ? Date.parse(r.deleted_at) : null;
+          if (r.status !== row.status || !!r.optimized !== !!row.optimized || delBack !== delSent) {
+            throw new Error("Journée " + row.date + " : le serveur n'a pas les valeurs envoyées");
           }
         }
-        s._addressId = addrKeys[s.addressKey];
       }
-      // v10 : les SUPPRESSIONS d'abord — si la poussée est
-      // interrompue en plein vol (page fermée ou rechargée juste
-      // après une suppression), l'état serveur reste cohérent :
-      // journées et arrêts supprimés partent en premier.
-      // v16 : erreurs VÉRIFIÉES ici aussi (avant, un échec silencieux
-      // laissait croire que la suppression était rendue au serveur).
-      {
-        const daysPreRes = await supa.from("days").select("id,date");
-        throwIfError("Suppressions (lecture des journées)", daysPreRes);
-        const preByDate = {};
-        (daysPreRes.data || []).forEach((d) => { preByDate[d.date] = d.id; });
-        for (const d of DB.days) {
-          if (!d.deletedAt || !preByDate[d.date]) continue;
-          throwIfError("Suppression de journée", await supa.from("days").upsert({
-            id: preByDate[d.date], date: d.date,
-            deleted_at: new Date(d.deletedAt).toISOString()
-          }, { onConflict: "date" }));
-        }
-        const delStops = [];
-        for (const s of DB.stops) {
-          if (!s.deletedAt || !uuidOk(s.id)) continue;
-          // v16 : seulement les arrêts CONNUS du serveur (dans
-          // l'ombre) — l'upsert partiel ci-dessous met à jour une
-          // ligne existante ; pour un arrêt créé puis supprimé
-          // avant sa première poussée, il tenterait une insertion
-          // incomplète (colonnes obligatoires manquantes) et
-          // ferait échouer toute la poussée. Ceux-là partent en
-          // ligne complète dans la boucle principale, plus bas.
-          if (!serverShadow || !serverShadow.stops.has(s.id)) continue;
-          const sDay = DB.days.find((x) => x.id === s.dayId);
-          if (!sDay || !preByDate[sDay.date]) continue;
-          delStops.push({ id: s.id, day_id: preByDate[sDay.date], deleted_at: new Date(s.deletedAt).toISOString() });
-        }
-        if (delStops.length) throwIfError("Suppression d'arrêts", await supa.from("stops").upsert(delStops, { onConflict: "id" }));
-      }
-
-      // v15 : ne réécrire que les journées différentes de l'ombre.
-      // v16 : en un seul lot.
-      const dayRows = [];
-      for (const d of DB.days) {
-        if (serverShadow && serverShadow.days.get(d.date) === shadowDayJSON(d)) continue;
-        dayRows.push(dayRowOf(d));
-      }
-      if (dayRows.length) throwIfError("Journées", await supa.from("days").upsert(dayRows, { onConflict: "date" }));
+      // Carte complète des identifiants de journées (les arrêts y
+      // font référence) — relue, jamais supposée.
       const dayIdByDate = {};
       const daysNowRes = await supa.from("days").select("id,date");
       throwIfError("Lecture des journées", daysNowRes);
-      const daysNow = daysNowRes.data || [];
-      daysNow.forEach((d) => { dayIdByDate[d.date] = d.id; });
-      // v16 : les arrêts partent en LOT (un aller-retour par tranche
-      // de 50) avec erreurs vérifiées. Avant : un aller-retour PAR
-      // arrêt, erreurs jamais lues — une poussée pouvait prendre
-      // des dizaines de secondes ET échouer en silence, puis
-      // l'ombre (v15) marquait quand même les arrêts comme rendus.
+      (daysNowRes.data || []).forEach((d) => { dayIdByDate[d.date] = d.id; });
+      // 3. Arrêts sales — lots de 50, VÉRIFIÉS ligne par ligne sur
+      // des champs témoins (téléphone, position, eta, corbeille) :
+      // si le serveur n'a pas appliqué l'écriture, la ligne
+      // retournée le trahit et tout le cycle échoue (voir plus bas).
       const stopRows = [];
-      for (const s of DB.stops) {
+      const legacyStops = [];
+      const blockedStops = []; // journée inconnue du serveur : on saute l'arrêt ce cycle-ci (il reste « sale »), sans bloquer les autres
+      for (const s of workStops) {
+        if (!todoStops.has(s.id)) continue;
         const day = DB.days.find((x) => x.id === s.dayId);
-        if (!day || !dayIdByDate[day.date]) continue;
+        if (!day || !dayIdByDate[day.date]) { blockedStops.push(s.id); continue; }
         const row = stopRowOf(s, dayIdByDate[day.date], s._addressId || null);
-        if (uuidOk(s.id)) {
-          // v15 : ne réécrire que les arrêts différents de l'ombre.
-          if (serverShadow && serverShadow.stops.get(s.id) === stopShadowJSON(s, dayIdByDate[day.date], s._addressId || null)) continue;
-          stopRows.push(Object.assign({ id: s.id }, row));
-        } else {
-          // v8 : ancien identifiant local — insertion UNE fois, puis
-          // adoption de l'identifiant serveur retourné. Avant, chaque
-          // poussée insérait une nouvelle copie de l'arrêt au serveur.
-          const res = await supa.from("stops").insert(row).select("id").single();
-          throwIfError("Arrêt (insertion)", res);
-          if (res.data && res.data.id) adoptStopId(s, res.data.id);
-        }
+        if (row.phone == null) row.phone = null;       // clés toujours présentes dans le lot
+        if (row.eta_min == null) row.eta_min = null;   // (sinon PostgREST peut ignorer la colonne)
+        if (uuidOk(s.id)) stopRows.push(Object.assign({ id: s.id }, row));
+        else legacyStops.push({ s, row });
+      }
+      for (const { s, row } of legacyStops) {
+        // v8 : ancien identifiant local — insertion UNE fois, puis
+        // adoption de l'identifiant serveur retourné et VÉRIFIÉ.
+        const res = await supa.from("stops").insert(row).select("id").single();
+        throwIfError("Arrêt (insertion)", res);
+        if (!res.data || !res.data.id) throw new Error("Arrêt : insertion non confirmée par le serveur");
+        adoptedMap[s.id] = res.data.id;
+        adoptStopId(s, res.data.id);
       }
       for (let i = 0; i < stopRows.length; i += 50) {
-        throwIfError("Arrêts", await supa.from("stops").upsert(stopRows.slice(i, i + 50), { onConflict: "id" }));
+        const chunk = stopRows.slice(i, i + 50);
+        const res = await supa.from("stops").upsert(chunk, { onConflict: "id" }).select("id,phone,position,eta_min,deleted_at");
+        throwIfError("Arrêts", res);
+        const back = {};
+        (res.data || []).forEach((r) => { back[r.id] = r; });
+        for (const row of chunk) {
+          const r = back[row.id];
+          if (!r) throw new Error("Arrêt " + row.id + " : écriture non confirmée par le serveur");
+          const delSent = row.deleted_at ? Date.parse(row.deleted_at) : null;
+          const delBack = r.deleted_at ? Date.parse(r.deleted_at) : null;
+          if ((r.phone || null) !== (row.phone || null) || r.position !== row.position ||
+              (r.eta_min != null ? r.eta_min : null) !== (row.eta_min != null ? row.eta_min : null) ||
+              delBack !== delSent) {
+            throw new Error("Arrêt " + row.id + " : le serveur n'a pas les valeurs envoyées");
+          }
+        }
       }
       persistLocal(); // garder les identifiants serveur adoptés
-      // Photos : rattachées à l'ARRÊT (photos des appareils, pour le
-      // chargement). Réconciliation par empreinte (data_url) avec le
-      // serveur : envoi des nouvelles, adoption des identifiants
-      // serveur, suppression de celles retirées sur l'appareil. Avant
-      // v7, les photos n'étaient JAMAIS envoyées au serveur — elles
-      // vivaient seulement sur le téléphone et un rechargement les
-      // effaçait (bug vu par William le 20 nov. 2026).
-      {
-        const srvStopsRes = await supa.from("stops").select("id,day_id,position,address_id");
-        throwIfError("Photos (lecture des arrêts serveur)", srvStopsRes);
-        const srvStops = srvStopsRes.data || [];
-        const srvStopByKey = {};
-        const srvStopById = {};
-        srvStops.forEach((ss) => {
-          srvStopById[ss.id] = ss;
-          const d = daysNow.find((x) => x.id === ss.day_id);
-          if (d) srvStopByKey[d.date + "|" + (ss.position || 0)] = ss;
-        });
-        // v15 : ne réconcilier les photos que des arrêts dont
-        // l'ensemble d'URLs diffère de l'ombre (ou dont l'arrêt
-        // local n'a pas encore d'identifiant serveur) — en régime
-        // courant, aucune requête photo du tout.
-        const photoStopIds = [];
-        for (const s of DB.stops) {
-          if (s.deletedAt) continue;
-          const day = DB.days.find((x) => x.id === s.dayId);
-          if (!day) continue;
-          const ss = srvStopById[s.id] || srvStopByKey[day.date + "|" + (s.position || 0)];
-          if (!ss) continue;
-          if (!uuidOk(s.id)) { photoStopIds.push(ss.id); continue; }
-          const localUrls = new Set((DB.photos[s.id] || []).map((p) => p.dataUrl));
-          const shUrls = serverShadow ? serverShadow.photos.get(ss.id) : null;
-          if (shUrls && shUrls.size === localUrls.size && [...localUrls].every((u) => shUrls.has(u))) continue;
-          photoStopIds.push(ss.id);
-        }
-        const srvPhotosRes = photoStopIds.length
-          ? await supa.from("photos").select("id,stop_id,data_url").in("stop_id", photoStopIds)
-          : { data: [] };
-        throwIfError("Photos (lecture serveur)", srvPhotosRes);
-        const srvPhotos = srvPhotosRes.data || [];
-        const srvByStop = {};
-        (srvPhotos || []).forEach((p) => {
-          if (!p.stop_id) return;
-          (srvByStop[p.stop_id] = srvByStop[p.stop_id] || []).push(p);
-        });
-        for (const s of DB.stops) {
-          if (s.deletedAt) continue;
-          const day = DB.days.find((x) => x.id === s.dayId);
-          if (!day) continue;
-          // v8 : correspondance par identifiant d'abord (fiable), repli
-          // sur date+position pour les anciens arrêts — avec adoption.
-          let ss = srvStopById[s.id] || srvStopByKey[day.date + "|" + (s.position || 0)];
-          if (!ss) continue;
-          if (photoStopIds.indexOf(ss.id) === -1) continue; // v15 : photos inchangées
-          if (!uuidOk(s.id)) adoptStopId(s, ss.id);
-          const local = DB.photos[s.id] || [];
-          const srv = srvByStop[ss.id] || [];
-          const srvUrls = new Set(srv.map((p) => p.data_url));
-          for (const p of local) {
-            if (srvUrls.has(p.dataUrl)) {
-              const sp = srv.find((x) => x.data_url === p.dataUrl);
-              if (sp && p.id !== sp.id) p.id = sp.id; // adopter l'identifiant serveur
-              continue;
-            }
-            const insRes = await supa.from("photos").insert({
-              stop_id: ss.id, address_id: ss.address_id || s._addressId || null, data_url: p.dataUrl
-            }).select("id").single();
-            throwIfError("Photo (envoi)", insRes);
-            if (insRes.data) { p.id = insRes.data.id; srvUrls.add(p.dataUrl); }
+      // 4. Photos des arrêts « photos sales » : rattachées à l'ARRÊT
+      // (photos des appareils, pour le chargement). Réconciliation
+      // par arrêt, par identifiant d'arrêt UNIQUEMENT (le repli
+      // date+position des v8-v16 pouvait viser le mauvais arrêt),
+      // puis RELECTURE et comparaison exacte des ensembles d'URLs :
+      // l'arrêt ne devient « propre » que si le serveur détient
+      // exactement les photos locales. (Avant v7, les photos
+      // n'étaient jamais envoyées au serveur — bug du 20 nov.)
+      for (const sid0 of todoPhotos) {
+        const sid = adoptedMap[sid0] || sid0;
+        const s = DB.stops.find((x) => x.id === sid);
+        if (!s) { dirtyPhotoStops.delete(sid0); continue; }
+        if (!uuidOk(s.id)) continue; // pas encore d'id serveur : restera sale, repartira après l'insertion de l'arrêt
+        if (blockedStops.indexOf(s.id) !== -1) continue; // journée absente du serveur : même sort que l'arrêt (voir étape 3)
+        const local = DB.photos[s.id] || [];
+        const readSrvPhotos = async () => {
+          const r = await supa.from("photos").select("id,data_url").eq("stop_id", s.id);
+          throwIfError("Photos (lecture serveur)", r);
+          return r.data || [];
+        };
+        let srv = await readSrvPhotos();
+        const srvUrls = new Set(srv.map((p) => p.data_url));
+        for (const p of local) {
+          if (srvUrls.has(p.dataUrl)) {
+            const sp = srv.find((x) => x.data_url === p.dataUrl);
+            if (sp && p.id !== sp.id) p.id = sp.id; // adopter l'identifiant serveur
+            continue;
           }
-          const localUrls = new Set(local.map((p) => p.dataUrl));
-          for (const p of srv) {
-            if (!localUrls.has(p.data_url)) throwIfError("Photo (suppression)", await supa.from("photos").delete().eq("id", p.id));
-          }
+          const insRes = await supa.from("photos").insert({
+            stop_id: s.id, address_id: s._addressId || null, data_url: p.dataUrl
+          }).select("id").single();
+          throwIfError("Photo (envoi)", insRes);
+          if (!insRes.data || !insRes.data.id) throw new Error("Photo : envoi non confirmé par le serveur");
+          p.id = insRes.data.id;
+          srvUrls.add(p.dataUrl);
         }
-        persistLocal(); // garder les identifiants serveur adoptés
+        const localUrls = new Set(local.map((p) => p.dataUrl));
+        for (const p of srv) {
+          if (!localUrls.has(p.data_url)) throwIfError("Photo (suppression)", await supa.from("photos").delete().eq("id", p.id));
+        }
+        // VÉRIFICATION FINALE : relire et comparer les ensembles.
+        srv = await readSrvPhotos();
+        const finalUrls = new Set(srv.map((p) => p.data_url));
+        if (finalUrls.size !== localUrls.size || [...localUrls].some((u) => !finalUrls.has(u))) {
+          throw new Error("Photos de l'arrêt " + s.id + " : le serveur n'a pas l'ensemble envoyé");
+        }
+        srv.forEach((sp) => {
+          const lp = local.find((x) => x.dataUrl === sp.data_url);
+          if (lp && lp.id !== sp.id) lp.id = sp.id;
+        });
       }
-      // v16 : on n'arrive ici que si TOUTES les écritures ont été
-      // confirmées par le serveur (chaque réponse est vérifiée) —
-      // seulement là, l'ombre peut avancer et l'état passer à « ok ».
-      rebuildShadowFromDB(dayIdByDate);
-      unpushedChanges = false; // v13 : tout est rendu au serveur
-      setSyncState("ok");
+      persistLocal(); // garder les identifiants de photos adoptés
+      // 5. On n'arrive ici que si TOUTES les écritures du cycle ont
+      // été VÉRIFIÉES. Seulement là, les entités poussées sortent
+      // des ensembles « sales » et leurs empreintes « propres »
+      // avancent — et seulement si leur empreinte n'a pas changé
+      // pendant la poussée (sinon elles restent sales et repartent).
+      todoDays.forEach((date) => {
+        const d = DB.days.find((x) => x.date === date);
+        if (!d) { dirtyDays.delete(date); return; }
+        if (fpDay0.has(date) && dayFP(d) === fpDay0.get(date)) { cleanDays.set(date, fpDay0.get(date)); dirtyDays.delete(date); }
+      });
+      todoStops.forEach((id0) => {
+        const id = adoptedMap[id0] || id0;
+        const s = DB.stops.find((x) => x.id === id);
+        if (!s) { dirtyStops.delete(id0); dirtyStops.delete(id); return; }
+        if (fpStop0.has(id0) && stopFP(s) === fpStop0.get(id0)) { cleanStops.set(id, fpStop0.get(id0)); dirtyStops.delete(id0); dirtyStops.delete(id); }
+      });
+      todoPhotos.forEach((sid0) => {
+        const sid = adoptedMap[sid0] || sid0;
+        const s = DB.stops.find((x) => x.id === sid);
+        if (!s) { dirtyPhotoStops.delete(sid0); dirtyPhotoStops.delete(sid); return; }
+        if (!uuidOk(s.id)) return; // jamais parti : reste sale
+        if (fpPhoto0.has(sid0) && photoFP(DB.photos[sid]) === fpPhoto0.get(sid0)) {
+          cleanPhotos.set(sid, fpPhoto0.get(sid0)); dirtyPhotoStops.delete(sid0); dirtyPhotoStops.delete(sid);
+        }
+      });
+      persistSyncMeta();
+      persistLocal();
+      refreshUnpushed();
+      if (blockedStops.length) {
+        // Des arrêts n'ont pas pu partir (journée absente du
+        // serveur) : état d'erreur honnête + nouvel essai espacé,
+        // le reste du cycle, lui, est bel et bien rendu.
+        console.warn("Synchro incomplète — arrêts sans journée au serveur :", blockedStops);
+        setSyncState("error");
+        scheduleSyncRetry();
+      }
+      else if (unpushedChanges) { setSyncState("pending"); pushSupabaseSoon(); } // il reste du travail (changé pendant la poussée)
+      else setSyncState("ok");
       pushSnapshotSupabase(); // v16 : en arrière-plan — ne bloque plus la poussée
     } catch (e) {
       console.warn("Synchro Supabase ÉCHOUÉE — les données restent sur l'appareil, nouvel essai automatique.", e);
@@ -947,7 +1052,14 @@
     const oldDays = DB.days.filter((d) => d.deletedAt && d.deletedAt < cutoff && !DB.stops.some((s) => s.dayId === d.id));
     for (const d of oldDays) { await deleteRemote("days", d.id); }
     if (oldDays.length) DB.days = DB.days.filter((d) => !oldDays.includes(d));
-    if (oldStops.length || oldDays.length) persistLocal();
+    if (oldStops.length || oldDays.length) {
+      // v17 : les entités purgées sortent aussi du suivi de synchro.
+      oldStops.forEach((s) => { dirtyStops.delete(s.id); dirtyPhotoStops.delete(s.id); cleanStops.delete(s.id); cleanPhotos.delete(s.id); });
+      oldDays.forEach((d) => { dirtyDays.delete(d.date); cleanDays.delete(d.date); });
+      persistLocal();
+      persistSyncMeta();
+      refreshUnpushed();
+    }
   }
 
   function uuidOk(v) {
@@ -1013,8 +1125,13 @@
       days: obj.days, stops: obj.stops, photos: obj.photos || {}
     };
     dedupeDays();
+    // v17 : tout le contenu restauré est « sale » — il sera poussé
+    // et vérifié comme du neuf.
+    cleanDays.clear(); cleanStops.clear(); cleanPhotos.clear();
+    recomputeDirty();
     persistLocal();
-    if (MODE === "supabase") pushSupabaseNow();
+    persistSyncMeta();
+    if (MODE === "supabase") { setSyncState("pending"); pushSupabaseNow(); }
   }
 
   /* ================================================================
@@ -1027,7 +1144,8 @@
       onRemoteChange = remoteCb || null;
       if (MODE === "supabase") {
         loadLocal(); // cache local immédiat (affichage instantané + filet de sécurité)
-        loadShadow(); // v16 : ombre persistée — savoir ce que le serveur n'a pas encore
+        loadSyncMeta(); // v17 : ensembles « sales » + empreintes « propres » persistés
+        recomputeDirty(); // filet : tout écart local/empreinte devient « sale »
         dedupeDays();
         dedupeStops();
         migratePhotosToStops();
@@ -1052,6 +1170,7 @@
           return { needsAuth: true };
         } catch (e) {
           console.warn("Supabase injoignable, mode local de secours.", e);
+          setSyncState("error"); // v17 : jamais « ✓ Synchronisé » hors ligne
           return { needsAuth: false, offline: true };
         }
       }
@@ -1066,11 +1185,15 @@
     /* À appeler après CHAQUE modification : écriture immédiate. */
     save() {
       persistLocal();
-      if (MODE === "supabase") { unpushedChanges = true; setSyncState("pending"); pushSupabaseSoon(); }
+      // v17 : chaque sauvegarde recalcule les ensembles « sales »
+      // (empreintes) et les persiste AVANT de planifier la poussée —
+      // une modification est donc suivie explicitement, jamais
+      // déduite d'une comparaison rejouée plus tard.
+      if (MODE === "supabase") { recomputeDirty(); persistSyncMeta(); setSyncState("pending"); pushSupabaseSoon(); }
     },
     saveNow() { // synchro immédiate (ex. avant de quitter l'écran)
       persistLocal();
-      if (MODE === "supabase") { unpushedChanges = true; setSyncState("pending"); pushSupabaseNow(); }
+      if (MODE === "supabase") { recomputeDirty(); persistSyncMeta(); setSyncState("pending"); pushSupabaseNow(); }
     },
     /* v16 : l'interface affiche l'état réel de la synchro. */
     setSyncListener(fn) { onSyncState = fn; if (fn) { try { fn(syncState); } catch (e) { /* affichage */ } } },
