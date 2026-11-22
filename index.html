@@ -1,0 +1,308 @@
+<!DOCTYPE html>
+<html lang="fr-CA" data-theme="dark">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>WL Livraison — WL Ameublement</title>
+<meta name="description" content="Application de dispatch de livraisons de WL Ameublement">
+<link rel="manifest" href="manifest.webmanifest">
+<meta name="theme-color" content="#0d1117">
+<link rel="apple-touch-icon" href="icons/apple-touch-icon.png">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="WL Livraison">
+<link rel="icon" type="image/png" href="icons/icon-192.png">
+<style>html,body{background:#0d1117;}</style>
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+
+<!-- ======================= ÉCRAN : ACCUEIL (journées) ======================= -->
+<section id="view-home" class="view">
+  <header class="app-header">
+    <div class="brand-badge">WL</div>
+    <div class="brand-text">
+      <div class="brand-name">WL Ameublement</div>
+      <div class="brand-sub" id="brandSub">wlameublement@gmail.com</div>
+      <div class="brand-sub" id="syncNote" style="font-weight:600"></div>
+    </div>
+    <button class="icon-btn" id="btnSettings" aria-label="Réglages">⚙</button>
+  </header>
+
+  <div id="demoBanner" class="demo-banner" hidden>
+    Mode démo local — données sur ce téléphone seulement.
+    Branche Supabase pour synchroniser les 4 utilisateurs.
+  </div>
+
+  <div class="search-box home-search">
+    <span class="search-ico">🔍</span>
+    <input id="homeSearch" type="search" placeholder="Rechercher une adresse, un nom, un téléphone…" autocomplete="off">
+  </div>
+  <div id="searchResults" hidden></div>
+
+  <main id="dayList" class="day-list"></main>
+
+  <div class="bottom-bar">
+    <button class="btn-primary big" id="btnCreateDay">+ Créer un trajet</button>
+  </div>
+</section>
+
+<!-- ======================= ÉCRAN : ITINÉRAIRE D'UNE JOURNÉE ======================= -->
+<section id="view-day" class="view" hidden>
+  <header class="sub-header">
+    <button class="back-btn" id="btnBackHome">‹ Journées</button>
+    <button class="link-btn" id="btnDaySettings">Réglages</button>
+  </header>
+
+  <div class="day-title-block">
+    <h1 id="dayTitle">Vendredi 20 novembre 2026</h1>
+    <div class="day-meta">
+      <span>Départ <span class="chip-btn" id="btnStartTime">08:00</span></span>
+      <span id="dayStopsCount">0 arrêt</span>
+      <span id="dayRouteState">Route non calculée</span>
+    </div>
+  </div>
+
+  <button class="btn-sheet" id="btnPdf">Feuille de route PDF</button>
+
+  <div class="search-row">
+    <div class="search-box">
+      <span class="search-ico">⌕</span>
+      <input id="addrSearch" type="text" placeholder="Ajouter ou trouver des arrêts..." autocomplete="off">
+    </div>
+    <button class="btn-add" id="btnAddStop" aria-label="Ajouter un arrêt">+</button>
+  </div>
+  <div id="suggestBox" class="suggest-box" hidden></div>
+  <div class="search-hint">Tape une adresse, choisis la suggestion : l'arrêt s'ajoute à la journée.</div>
+
+  <div id="timeline" class="timeline"></div>
+
+  <button class="btn-dashed" id="btnAddStop2">+ Ajouter un arrêt</button>
+
+  <div class="route-bar">
+    <div class="route-total">
+      <div class="route-total-time" id="routeTotalTime">—</div>
+      <div class="route-total-sub" id="routeTotalSub">Ajoute des arrêts pour calculer le trajet</div>
+    </div>
+    <button class="btn-primary" id="btnOptimize">Optimiser</button>
+    <button class="btn-confirm" id="btnConfirm" hidden>Confirmer le trajet</button>
+  </div>
+</section>
+
+<!-- ======================= ÉCRAN : DÉTAIL D'UN ARRÊT ======================= -->
+<section id="view-stop" class="view" hidden>
+  <header class="sub-header">
+    <button class="back-btn" id="btnBackDay">‹ Retour</button>
+    <div class="stop-head-date" id="stopDayDate"></div>
+  </header>
+
+  <h1 class="screen-title">Modifier l'arrêt</h1>
+
+  <div id="missingBanner" class="missing-banner" hidden></div>
+
+  <form id="stopForm" autocomplete="off">
+    <label class="fld-label" for="fAddress">Adresse (sélectionne une suggestion pour la localiser)</label>
+    <input class="fld" id="fAddress" type="text" placeholder="Ex. : 1897 Boulevard Bastien">
+    <div id="stopSuggestBox" class="suggest-box in-form" hidden></div>
+
+    <div class="card">
+      <label class="fld-label" for="fClient">Nom du client</label>
+      <input class="fld" id="fClient" type="text" placeholder="Nom du client">
+      <label class="fld-label" for="fApartment">Appartement</label>
+      <div class="apt-row">
+        <input class="fld" id="fApartment" type="text" placeholder="Ex. : 110">
+        <button type="button" class="apt-none" id="aptNone">Aucun</button>
+      </div>
+      <label class="fld-label" for="fPhone">Téléphone</label>
+      <input class="fld" id="fPhone" type="tel" placeholder="418 000-0000">
+    </div>
+
+    <div class="card">
+      <button type="button" class="row-btn" id="rowVendor">
+        <span class="row-label">Vendeur</span>
+        <span class="row-value" id="vendorValue">William ›</span>
+      </button>
+      <label class="fld-label" for="fAppliance">Appareil</label>
+      <input class="fld" id="fAppliance" type="text" placeholder="Ex. : Laveuse Whirlpool">
+      <div class="row-between">
+        <span class="row-label">Nombre de morceaux</span>
+        <div class="stepper">
+          <button type="button" id="piecesMinus" aria-label="Moins">−</button>
+          <span id="piecesValue">1</span>
+          <button type="button" id="piecesPlus" aria-label="Plus">+</button>
+        </div>
+      </div>
+      <div class="row-between">
+        <span class="row-label">Installation avec tuyaux inclus</span>
+        <div class="segmented" id="segInstall">
+          <button type="button" data-v="yes">Oui</button>
+          <button type="button" data-v="no" class="on">Non</button>
+        </div>
+      </div>
+      <div class="row-between">
+        <span class="row-label">Appareil à reprendre</span>
+        <div class="segmented" id="segPickup">
+          <button type="button" data-v="yes">Oui</button>
+          <button type="button" data-v="no" class="on">Non</button>
+        </div>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="row-between">
+        <span class="row-label">⇅ Ordre</span>
+        <div class="segmented" id="segOrder">
+          <button type="button" data-v="premier">Premier</button>
+          <button type="button" data-v="auto" class="on">Auto</button>
+          <button type="button" data-v="dernier">Dernier</button>
+        </div>
+      </div>
+      <div class="row-between">
+        <span class="row-label">▣ Type</span>
+        <div class="segmented" id="segType">
+          <button type="button" data-v="livraison" class="on">Livraison</button>
+          <button type="button" data-v="collecte">Collecte</button>
+        </div>
+      </div>
+      <button type="button" class="row-btn" id="rowWindow">
+        <span class="row-label">◷ Heure d'arrivée</span>
+        <span class="row-value" id="windowValue">N'importe quand</span>
+      </button>
+      <div class="row-between">
+        <span class="row-label">Durée d'arrêt</span>
+        <span class="row-value">15 min</span>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="card-head">
+        <span class="card-title">Détails de la livraison</span>
+        <span class="saved-note" id="saveNote">Enregistrement automatique</span>
+      </div>
+      <textarea class="fld area" id="fDetails" rows="4" placeholder="Sonner à l'arrivée, entrée sur le côté, ancien appareil à reprendre..."></textarea>
+      <p class="hint">Ces infos restent sauvegardées pour les livraisons futures à cette adresse.</p>
+    </div>
+
+    <div class="card">
+      <div class="card-head">
+        <span class="card-title">Photos</span>
+        <span class="photo-count" id="photoCount">0 / 10</span>
+      </div>
+      <div class="photo-grid" id="photoGrid"></div>
+      <p class="hint">Photos des appareils de cet arrêt : elles servent au chargement, pour retrouver les bons appareils dans l'entrepôt. Maximum 10, enregistrées dans l'arrêt.</p>
+      <input type="file" id="photoInput" accept="image/*" multiple hidden>
+    </div>
+
+    <div class="stop-actions">
+      <button type="button" class="btn-nav" id="btnNavigate">Naviguer</button>
+    </div>
+    <div class="stop-actions secondary">
+      <button type="button" class="btn-ghost" id="btnDuplicateStop">Dupliquer l'arrêt</button>
+      <button type="button" class="btn-ghost danger" id="btnDeleteStop">Supprimer l'arrêt</button>
+    </div>
+  </form>
+</section>
+
+<!-- ======================= FEUILLE : CHOIX DU VENDEUR ======================= -->
+<div class="sheet-backdrop" id="vendorSheet" hidden>
+  <div class="sheet">
+    <h2>Vendeur</h2>
+    <p class="sheet-sub">Qui a fait la vente pour cet arrêt.</p>
+    <div id="vendorList"></div>
+    <button class="btn-sheet-cancel" data-close="vendorSheet">Annuler</button>
+  </div>
+</div>
+
+<!-- ======================= FEUILLE : HEURE D'ARRIVÉE ======================= -->
+<div class="sheet-backdrop" id="windowSheet" hidden>
+  <div class="sheet">
+    <div class="sheet-head">
+      <button class="link-btn" data-close="windowSheet">Annuler</button>
+      <h2>Heure d'arrivée</h2>
+      <button class="link-btn strong" id="btnWindowDone">Terminé</button>
+    </div>
+    <div id="windowSlots"></div>
+    <button class="btn-add-slot" id="btnAddSlot">+ Autre créneau</button>
+  </div>
+</div>
+
+<!-- ======================= FEUILLE : QUI ES-TU (siège) ======================= -->
+<div class="sheet-backdrop" id="profileSheet" hidden>
+  <div class="sheet">
+    <h2>Qui utilise ce téléphone ?</h2>
+    <p class="sheet-sub">Ton nom devient automatiquement le vendeur des arrêts que tu ajoutes.</p>
+    <div id="profileList"></div>
+  </div>
+</div>
+
+<!-- ======================= FEUILLE : CRÉER UN TRAJET ======================= -->
+<div class="sheet-backdrop" id="createDaySheet" hidden>
+  <div class="sheet">
+    <h2>Créer un trajet</h2>
+    <p class="sheet-sub">Choisis la date de la journée de livraison.</p>
+    <label class="fld-label" for="newDayDate">Date</label>
+    <input class="fld" type="date" id="newDayDate">
+    <button class="btn-primary big block" id="btnDoCreateDay">Créer la journée</button>
+    <button class="btn-sheet-cancel" data-close="createDaySheet">Annuler</button>
+  </div>
+</div>
+
+<!-- ======================= FEUILLE : CONNEXION (mode Supabase) ======================= -->
+<div class="sheet-backdrop" id="loginSheet" hidden>
+  <div class="sheet">
+    <h2>Connexion</h2>
+    <p class="sheet-sub">Connecte-toi avec ton compte WL pour synchroniser les journées avec l'équipe.</p>
+    <label class="fld-label" for="loginEmail">Courriel</label>
+    <input class="fld" id="loginEmail" type="email" autocomplete="username" placeholder="nom@exemple.com">
+    <label class="fld-label" for="loginPass">Mot de passe</label>
+    <input class="fld" id="loginPass" type="password" autocomplete="current-password" placeholder="Mot de passe">
+    <button class="btn-primary big block" id="btnDoLogin">Se connecter</button>
+    <p class="hint" id="loginError" hidden></p>
+  </div>
+</div>
+
+<!-- ======================= FEUILLE : RÉGLAGES ======================= -->
+<div class="sheet-backdrop" id="settingsSheet" hidden>
+  <div class="sheet">
+    <h2>Réglages</h2>
+    <div class="row-between">
+      <span class="row-label">Utilisateur de ce téléphone</span>
+      <span class="row-value" id="settingsProfile">—</span>
+    </div>
+    <button class="btn-sheet-cancel" id="btnChangeProfile">Changer d'utilisateur</button>
+    <div class="row-between">
+      <span class="row-label">Mode de données</span>
+      <span class="row-value" id="settingsMode">Démo local</span>
+    </div>
+    <p class="hint" id="settingsHint">Les données sont gardées sur ce téléphone. Pour synchroniser les 4 utilisateurs, remplis config.js avec les clés Supabase (voir README).</p>
+    <h2 class="settings-sub">Sauvegarde</h2>
+    <p class="hint">Tout est enregistré automatiquement à chaque saisie, plus une copie de secours et un snapshot quotidien sur l'appareil. En plus, exporte une sauvegarde complète quand tu veux :</p>
+    <button class="btn-sheet-cancel" id="btnExport">⬇ Exporter une sauvegarde (JSON)</button>
+    <button class="btn-sheet-cancel" id="btnImport">⬆ Restaurer une sauvegarde</button>
+    <input type="file" id="importInput" accept="application/json,.json" hidden>
+    <p class="hint" id="snapInfo"></p>
+    <h2 class="settings-sub">Corbeille</h2>
+    <p class="hint" id="trashInfo">Les arrêts et journées supprimés restent récupérables ici pendant 30 jours.</p>
+    <div id="trashList"></div>
+    <button class="btn-sheet-cancel" data-close="settingsSheet">Fermer</button>
+  </div>
+</div>
+
+<!-- ======================= FEUILLE DE ROUTE (impression / PDF) ======================= -->
+<div id="routeSheet" class="route-sheet" hidden></div>
+
+<div id="toast" class="toast" hidden></div>
+
+<script src="config.js"></script>
+<script src="data.js"></script>
+<script src="app.js"></script>
+<script>
+  if ("serviceWorker" in navigator) {
+    window.addEventListener("load", () => {
+      navigator.serviceWorker.register("sw.js").catch(() => {});
+    });
+  }
+</script>
+</body>
+</html>
