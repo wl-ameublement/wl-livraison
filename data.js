@@ -312,6 +312,15 @@
   }
 
   async function reloadFromSupabase() {
+    // v20 : pendant toute la fusion, merging = true — les
+    // suppressions qui apparaissent dans la base fusionnée ne
+    // sont pas des gestes de l'utilisateur (garde-fou corbeille).
+    merging = true;
+    // v20 : photo des ensembles « sales » d'AVANT la fusion —
+    // refreshCleanFromDB s'en sert pour distinguer une vraie
+    // modification locale en attente d'une entité simplement
+    // jamais marquée propre (voir son commentaire).
+    const preDirty = { days: new Set(dirtyDays), stops: new Set(dirtyStops), photos: new Set(dirtyPhotoStops) };
     const [daysR, stopsR, photosR, profR, addrR] = await Promise.all([
       supa.from("days").select("*").order("date"),
       supa.from("stops").select("*").order("position"),
@@ -330,6 +339,7 @@
     if (daysR.error || stopsR.error || photosR.error || addrR.error) {
       console.warn("Rechargement Supabase abandonné (lecture en erreur).",
         daysR.error || stopsR.error || photosR.error || addrR.error);
+      merging = false;
       setSyncState("error");
       scheduleSyncRetry();
       return;
@@ -388,6 +398,7 @@
       const r = await supa.from("photos").select("*").in("stop_id", changedStopIds);
       if (r.error) { // v17 : abandonner plutôt que de tronquer les photos
         console.warn("Rechargement abandonné (photos illisibles).", r.error);
+        merging = false;
         setSyncState("error"); scheduleSyncRetry(); return;
       }
       fullPhotos = r.data || [];
@@ -396,6 +407,7 @@
       const r = await supa.from("photos").select("*").in("id", legacyPhotoIds);
       if (r.error) {
         console.warn("Rechargement abandonné (photos illisibles).", r.error);
+        merging = false;
         setSyncState("error"); scheduleSyncRetry(); return;
       }
       fullPhotos = fullPhotos.concat(r.data || []);
@@ -567,14 +579,20 @@
     // absorption. Ensuite seulement, les empreintes des entités
     // venues du serveur et non sales avancent jusqu'à l'état lu.
     recomputeDirty();
-    refreshCleanFromDB(srvDayDateSet, srvStopIdSet);
+    refreshCleanFromDB(srvDayDateSet, srvStopIdSet, preDirty);
     // La copie locale reflète TOUJOURS la base fusionnée — sinon,
     // au prochain démarrage, une vieille copie locale serait prise
     // pour un changement local et écraserait le serveur.
     persistLocal();
     persistSyncMeta();
+    // v20 : fin de fusion — les cartes corbeille « connues » sont
+    // reconstruites depuis la base fusionnée (sans rien marquer
+    // d'explicite), puis seulement les gestes utilisateur comptent.
+    merging = false;
+    refreshKnownDeleted();
     refreshUnpushed();
-    if (unpushedChanges) { setSyncState("pending"); pushSupabaseSoon(); } // envoyer la surcouche
+    if (actionableCount() > 0) { setSyncState("pending"); pushSupabaseSoon(); } // envoyer la surcouche
+    else if (quarantineCount() > 0) setSyncState("error"); // v20 : quarantaine = erreur visible, jamais « ✓ Synchronisé »
     else setSyncState("ok");
   }
 
@@ -718,11 +736,48 @@
   const LS_SYNC = "wl_livraison_sync_v17";
   let cleanDays = new Map(), cleanStops = new Map(), cleanPhotos = new Map();
   let dirtyDays = new Set(), dirtyStops = new Set(), dirtyPhotoStops = new Set();
+  /* v20 : ISOLATION DES ERREURS + QUARANTAINE (état persisté).
+     En v17-v19, la poussée était UN bloc try/catch : la première
+     écriture qui échouait (ou dont la vérification différait)
+     levait une exception qui annulait TOUT le cycle — l'étape qui
+     retire les entités confirmées des ensembles « sales » ne
+     tournait pas, donc même les entités saines restaient « sales »,
+     et le cycle suivant réessayait tout et rééchouait au même
+     endroit : la synchro ne se terminait JAMAIS (test de charge
+     v19 : ~25 min, 8 rechargements, jamais « ✓ Synchronisé »).
+     En v20, chaque entité est isolée : son échec est compté ici,
+     et après QUARANTINE_AFTER échecs elle est mise en QUARANTAINE
+     (persistée) — exclue des poussées, le reste de la synchro se
+     termine, et l'état reste « error » (visible) tant qu'il reste
+     une entité en quarantaine. Sortie de quarantaine : l'entité
+     est MODIFIÉE (empreinte différente), le délai QUARANTINE_MS
+     s'écoule, ou saveNow() la retente (compteur conservé : un
+     échec la remet en quarantaine immédiatement, sans boucle). */
+  const QUARANTINE_AFTER = 5;
+  const QUARANTINE_MS = 15 * 60 * 1000;
+  let failCounts = { days: {}, stops: {}, photos: {} };
+  let quarantine = { days: {}, stops: {}, photos: {} }; // clé -> { fp, at }
+  /* v20 : GARDE-FOU CORBEILLE — arrêts (par id) et journées (par
+     date) dont la suppression a été EXPLICITEMENT demandée par
+     l'utilisateur : transition vivant -> corbeille observée dans
+     recomputeDirty() HORS fusion de rechargement (voir
+     noteTrashTransitions). Persisté : une suppression demandée
+     juste avant un rechargement reste légitime après. La poussée
+     refuse toute autre suppression (voir pushCycleLocked). */
+  let explicitTrashStops = new Set(), explicitTrashDays = new Set();
+  /* v20 : dernier état corbeille CONNU de chaque entité — sert à
+     détecter les transitions explicites. Reconstruit après chaque
+     rechargement : ce qu'une fusion y a mis n'est jamais tenu
+     pour un geste de l'utilisateur. */
+  let knownDeletedStops = new Map(), knownDeletedDays = new Map();
+  let merging = false; // vrai pendant reloadFromSupabase()
   function persistSyncMeta() {
     try {
       localStorage.setItem(LS_SYNC, JSON.stringify({
         cleanDays: [...cleanDays], cleanStops: [...cleanStops], cleanPhotos: [...cleanPhotos],
-        dirtyDays: [...dirtyDays], dirtyStops: [...dirtyStops], dirtyPhotoStops: [...dirtyPhotoStops]
+        dirtyDays: [...dirtyDays], dirtyStops: [...dirtyStops], dirtyPhotoStops: [...dirtyPhotoStops],
+        failCounts, quarantine,
+        explicitTrashStops: [...explicitTrashStops], explicitTrashDays: [...explicitTrashDays]
       }));
     } catch (e) { /* le filet recomputeDirty() au prochain démarrage rattrape */ }
   }
@@ -735,14 +790,110 @@
         cleanPhotos = new Map(o.cleanPhotos || []);
         dirtyDays = new Set(o.dirtyDays || []); dirtyStops = new Set(o.dirtyStops || []);
         dirtyPhotoStops = new Set(o.dirtyPhotoStops || []);
+        failCounts = o.failCounts || { days: {}, stops: {}, photos: {} };
+        quarantine = o.quarantine || { days: {}, stops: {}, photos: {} };
+        explicitTrashStops = new Set(o.explicitTrashStops || []);
+        explicitTrashDays = new Set(o.explicitTrashDays || []);
         return;
       }
     } catch (e) { /* première fois */ }
     cleanDays = new Map(); cleanStops = new Map(); cleanPhotos = new Map();
     dirtyDays = new Set(); dirtyStops = new Set(); dirtyPhotoStops = new Set();
+    failCounts = { days: {}, stops: {}, photos: {} };
+    quarantine = { days: {}, stops: {}, photos: {} };
+    explicitTrashStops = new Set(); explicitTrashDays = new Set();
   }
   function refreshUnpushed() {
     unpushedChanges = dirtyDays.size + dirtyStops.size + dirtyPhotoStops.size > 0;
+  }
+  /* v20 : empreinte courante d'une entité suivie (pour la
+     quarantaine : comparer l'empreinte au moment de la mise de
+     côté à celle d'aujourd'hui). null = entité disparue. */
+  function currentFP(kind, key) {
+    if (!DB) return null;
+    if (kind === "days") { const d = (DB.days || []).find((x) => x.date === key); return d ? dayFP(d) : null; }
+    if (kind === "stops") { const s = (DB.stops || []).find((x) => x.id === key); return s ? stopFP(s) : null; }
+    const s = (DB.stops || []).find((x) => x.id === key);
+    return s ? photoFP((DB.photos || {})[key]) : null;
+  }
+  /* v20 : sortie de quarantaine — entité disparue, MODIFIÉE
+     depuis sa mise de côté (empreinte différente), ou délai
+     écoulé. La sortie rend des chances fraîches (compteur à zéro)
+     et recomputeDirty() remettra l'entité dans les ensembles
+     « sales » si son empreinte diffère de l'empreinte propre. */
+  function releaseQuarantine() {
+    if (!DB) return;
+    const now = Date.now();
+    ["days", "stops", "photos"].forEach((kind) => {
+      Object.keys(quarantine[kind]).forEach((key) => {
+        const q = quarantine[kind][key];
+        const fp = currentFP(kind, key);
+        if (fp === null || fp !== q.fp || now - (q.at || 0) > QUARANTINE_MS) {
+          delete quarantine[kind][key];
+          delete failCounts[kind][key];
+        }
+      });
+    });
+  }
+  function noteFailure(kind, key) {
+    failCounts[kind][key] = (failCounts[kind][key] || 0) + 1;
+    if (failCounts[kind][key] >= QUARANTINE_AFTER && !quarantine[kind][key]) {
+      quarantine[kind][key] = { fp: currentFP(kind, key), at: Date.now() };
+      console.warn("Synchro : entité mise en quarantaine après " + QUARANTINE_AFTER + " échecs (" + kind + " : " + key + ") — le reste de la synchro continue sans elle.");
+      if (window.WL_toast) { try { window.WL_toast("Un élément résiste à la synchro : il est mis de côté, le reste continue de se synchroniser."); } catch (e) { /* affichage seulement */ } }
+    }
+    persistSyncMeta();
+  }
+  function noteSuccess(kind, key) { if (failCounts[kind][key]) { delete failCounts[kind][key]; persistSyncMeta(); } }
+  /* Entités « sales » qui peuvent partir maintenant (hors
+     quarantaine) — c'est ça, « du travail à faire ». */
+  function actionableCount() {
+    let n = 0;
+    dirtyDays.forEach((k) => { if (!quarantine.days[k]) n++; });
+    dirtyStops.forEach((k) => { if (!quarantine.stops[k]) n++; });
+    dirtyPhotoStops.forEach((k) => { if (!quarantine.photos[k]) n++; });
+    return n;
+  }
+  function quarantineCount() {
+    return Object.keys(quarantine.days).length + Object.keys(quarantine.stops).length + Object.keys(quarantine.photos).length;
+  }
+  /* v20 : transitions corbeille EXPLICITES. Toute modification de
+     l'utilisateur passe par save()/saveNow() -> recomputeDirty()
+     HORS fusion : un passage vivant -> corbeille observé là est
+     un geste de l'utilisateur (cette session, ou une session
+     précédente du même appareil — l'ensemble est persisté). Un
+     passage corbeille -> vivant retire le sauf-conduit.
+     Pendant un rechargement (merging = true), RIEN n'est marqué :
+     la base est reconstruite par fusion (ligne serveur, règle
+     « l'arrêt suit sa journée supprimée », surcouche) — ce ne
+     sont pas des gestes de l'utilisateur. */
+  function noteTrashTransitions() {
+    (DB.days || []).forEach((d) => {
+      const now = d.deletedAt || null;
+      if (knownDeletedDays.has(d.date)) {
+        const prev = knownDeletedDays.get(d.date);
+        if (!prev && now) explicitTrashDays.add(d.date);
+        else if (prev && !now) explicitTrashDays.delete(d.date);
+      }
+      knownDeletedDays.set(d.date, now);
+    });
+    (DB.stops || []).forEach((s) => {
+      const now = s.deletedAt || null;
+      if (knownDeletedStops.has(s.id)) {
+        const prev = knownDeletedStops.get(s.id);
+        if (!prev && now) explicitTrashStops.add(s.id);
+        else if (prev && !now) explicitTrashStops.delete(s.id);
+      }
+      knownDeletedStops.set(s.id, now);
+    });
+  }
+  /* Après un rechargement : les cartes « connues » sont
+     reconstruites depuis la base fusionnée — sans rien marquer. */
+  function refreshKnownDeleted() {
+    knownDeletedDays = new Map(); knownDeletedStops = new Map();
+    if (!DB) return;
+    (DB.days || []).forEach((d) => knownDeletedDays.set(d.date, d.deletedAt || null));
+    (DB.stops || []).forEach((s) => knownDeletedStops.set(s.id, s.deletedAt || null));
   }
   /* Recalcule les ensembles « sales » en comparant chaque entité
      locale à son empreinte « propre ». Filet de sécurité appelé à
@@ -752,6 +903,7 @@
      vérifiée retire des ids. */
   function recomputeDirty() {
     if (!DB) return;
+    releaseQuarantine(); // v20 : une entité modifiée ou périmée sort de quarantaine
     (DB.days || []).forEach((d) => { if (cleanDays.get(d.date) !== dayFP(d)) dirtyDays.add(d.date); });
     (DB.stops || []).forEach((s) => { if (cleanStops.get(s.id) !== stopFP(s)) dirtyStops.add(s.id); });
     const photoStopIds = new Set([...Object.keys(DB.photos || {}), ...cleanPhotos.keys()]);
@@ -760,6 +912,7 @@
       if (fp === "" && !cleanPhotos.has(sid)) return; // arrêt sans photo jamais poussé : rien à suivre
       if (cleanPhotos.get(sid) !== fp) dirtyPhotoStops.add(sid);
     });
+    if (!merging) noteTrashTransitions(); // v20 : garde-fou corbeille (jamais pendant une fusion)
     refreshUnpushed();
   }
   /* Après un rechargement : les empreintes « propres » des entités
@@ -767,16 +920,41 @@
      l'état que le serveur vient de confirmer par cette lecture).
      Les entités absentes de la lecture (préservées localement) et
      les entités sales gardent leur ancienne empreinte. */
-  function refreshCleanFromDB(srvDayDateSet, srvStopIdSet) {
+  function refreshCleanFromDB(srvDayDateSet, srvStopIdSet, preDirty) {
     if (!DB) return;
+    // v20 : « non sale » se juge sur les ensembles d'AVANT ce
+    // rechargement (preDirty : les vraies modifications locales en
+    // attente). Le recomputeDirty() de fin de fusion, lui, marque
+    // « sale » toute entité lue du serveur dont l'empreinte n'a
+    // jamais été enregistrée — avec les ensembles courants, AUCUNE
+    // entité nouvellement lue n'avançait jamais son empreinte :
+    // elle restait « sale » et chaque fenêtre la REPOUSSAIT telle
+    // quelle au cycle suivant. C'est ce repoussage verbatim qui,
+    // au rodage v20 (run), a écrasé la corbeille d'un clone posée
+    // par la fenêtre active : une fenêtre périmée a réécrit sa
+    // copie vivante par-dessus, après coup. Une entité lue du
+    // serveur et non modifiée localement est PROPRE, point.
+    // Deuxième moitié du même correctif : l'entité ressort aussi
+    // de l'ensemble « sale ». recomputeDirty() ne rétrécit JAMAIS
+    // les ensembles (règle v17) : sans ce retrait, l'entité lue
+    // restait « sale » jusqu'à ce qu'un cycle la RÉÉCRIVE telle
+    // quelle au serveur — et si une autre fenêtre la corbeillait
+    // entre la lecture et ce repoussage, le repoussage la
+    // ressuscitait (prouvé au rodage v20, run : le clone corbeillé
+    // par la fenêtre active revenait vivant sous les repoussages
+    // des fenêtres périmées). Ici, la forme locale EST la forme
+    // lue du serveur : il n'y a rien à confirmer, rien à écrire.
+    const wasDirtyDay = (k) => (preDirty ? preDirty.days.has(k) : dirtyDays.has(k));
+    const wasDirtyStop = (k) => (preDirty ? preDirty.stops.has(k) : dirtyStops.has(k));
+    const wasDirtyPhoto = (k) => (preDirty ? preDirty.photos.has(k) : dirtyPhotoStops.has(k));
     (DB.days || []).forEach((d) => {
       if (srvDayDateSet && !srvDayDateSet.has(d.date)) return;
-      if (!dirtyDays.has(d.date)) cleanDays.set(d.date, dayFP(d));
+      if (!wasDirtyDay(d.date)) { cleanDays.set(d.date, dayFP(d)); dirtyDays.delete(d.date); }
     });
     (DB.stops || []).forEach((s) => {
       if (srvStopIdSet && !srvStopIdSet.has(s.id)) return;
-      if (!dirtyStops.has(s.id)) cleanStops.set(s.id, stopFP(s));
-      if (!dirtyPhotoStops.has(s.id)) cleanPhotos.set(s.id, photoFP((DB.photos || {})[s.id]));
+      if (!wasDirtyStop(s.id)) { cleanStops.set(s.id, stopFP(s)); dirtyStops.delete(s.id); }
+      if (!wasDirtyPhoto(s.id)) { cleanPhotos.set(s.id, photoFP((DB.photos || {})[s.id])); dirtyPhotoStops.delete(s.id); }
     });
     // Oublier les empreintes d'entités disparues de la base.
     const dates = new Set((DB.days || []).map((d) => d.date));
@@ -822,6 +1000,101 @@
     if (res && res.error) throw new Error(ctx + " : " + (res.error.message || "erreur Supabase"));
   }
 
+  /* v20 : VERROU DE SYNCHRO — une seule fenêtre synchronise à la
+     fois. Le test de charge v19 s'est déroulé avec possiblement
+     DEUX fenêtres de l'app ouvertes sur le même appareil (celle
+     du déploiement précédent, jamais fermée, + la nouvelle) :
+     deux moteurs de synchro sur le MÊME stockage local et le
+     MÊME serveur, chacun persistant SA vue fusionnée par-dessus
+     celle de l'autre entre les poussées — c'est ainsi que les
+     restaurations faites dans une fenêtre étaient annulées par
+     les rechargements de l'autre (voir le garde-fou corbeille
+     dans la poussée). Règle v20 : pousser exige un verrou exclusif.
+     - Si l'API Web Locks est disponible (navigateurs récents),
+       elle arbitre : la fenêtre détient le verrou nommé pendant
+       tout son cycle de poussée.
+     - Sinon, élection par battement de cœur dans localStorage :
+       le détenteur réécrit son jeton toutes les 2 s ; un jeton
+       sans battement depuis plus de 6 s est expiré (fenêtre fermée
+       ou rechargée en pleine poussée) et le verrou peut être pris.
+       La prise se fait en écriture + relecture synchrone : un
+       seul gagnant.
+     Une fenêtre qui n'obtient pas le verrou dans le délai
+     n'écrit RIEN : son cycle est replanifié (nouvel essai
+     automatique) — jamais de poussée en parallèle. Le verrou est
+     par appareil (stockage partagé) : entre deux APPAREILS, la
+     limite connue demeure (dernière poussée gagne, par entité). */
+  const LS_LOCK = "wl_livraison_sync_lock_v20";
+  const LOCK_TTL_MS = 6000, LOCK_BEAT_MS = 2000, LOCK_WAIT_MS = 30000;
+  const lockOwnerId = uid();
+  const HAS_WEB_LOCKS = typeof navigator !== "undefined" && !!navigator.locks && typeof navigator.locks.request === "function";
+  let syncLockHeld = false;
+  let lockBeatTimer = null;
+  let wlHeld = false, wlRequestPending = false, wlReleaseFn = null;
+  function readSyncLock() {
+    try { return JSON.parse(localStorage.getItem(LS_LOCK) || "null"); } catch (e) { return null; }
+  }
+  function hbTryTakeLock() {
+    const now = Date.now();
+    const cur = readSyncLock();
+    if (cur && cur.owner !== lockOwnerId && now - (cur.beat || 0) <= LOCK_TTL_MS) return false;
+    try { localStorage.setItem(LS_LOCK, JSON.stringify({ owner: lockOwnerId, beat: now })); } catch (e) { return false; }
+    const conf = readSyncLock();
+    return !!conf && conf.owner === lockOwnerId;
+  }
+  function hbBeatStart() {
+    hbBeatStop();
+    const beat = () => {
+      if (!syncLockHeld) return;
+      const cur = readSyncLock();
+      if (cur && cur.owner === lockOwnerId) {
+        try { localStorage.setItem(LS_LOCK, JSON.stringify({ owner: lockOwnerId, beat: Date.now() })); } catch (e) { /* page morte : le jeton expirera tout seul */ }
+      }
+      lockBeatTimer = setTimeout(beat, LOCK_BEAT_MS);
+    };
+    lockBeatTimer = setTimeout(beat, LOCK_BEAT_MS);
+  }
+  function hbBeatStop() { if (lockBeatTimer) { clearTimeout(lockBeatTimer); lockBeatTimer = null; } }
+  function wlTryStart() {
+    if (wlHeld || wlRequestPending) return;
+    wlRequestPending = true;
+    try {
+      const p = navigator.locks.request("wl_livraison_sync_v20", { ifAvailable: true }, async (lock) => {
+        if (!lock) { wlRequestPending = false; return; }
+        wlHeld = true;
+        await new Promise((res) => { wlReleaseFn = () => { wlRequestPending = false; res(); }; });
+        wlHeld = false; wlReleaseFn = null;
+      });
+      if (p && p.catch) p.catch(() => { wlRequestPending = false; });
+    } catch (e) { wlRequestPending = false; }
+  }
+  async function acquireSyncLock() {
+    if (syncLockHeld) return true;
+    const deadline = Date.now() + LOCK_WAIT_MS;
+    while (Date.now() < deadline) {
+      if (HAS_WEB_LOCKS) {
+        wlTryStart();
+        if (wlHeld) { syncLockHeld = true; return true; }
+      } else if (hbTryTakeLock()) {
+        syncLockHeld = true;
+        hbBeatStart();
+        return true;
+      }
+      await new Promise((r) => setTimeout(r, 250));
+    }
+    return false;
+  }
+  function releaseSyncLock() {
+    if (!syncLockHeld) return;
+    syncLockHeld = false;
+    hbBeatStop();
+    if (HAS_WEB_LOCKS) { if (wlReleaseFn) wlReleaseFn(); }
+    else {
+      const cur = readSyncLock();
+      if (cur && cur.owner === lockOwnerId) { try { localStorage.removeItem(LS_LOCK); } catch (e) { /* page morte : expiration naturelle */ } }
+    }
+  }
+
   let syncTimer = null;
   function pushSupabaseSoon() {
     // Poussée quasi immédiate (petit délai pour grouper les frappes d'un champ texte)
@@ -835,56 +1108,157 @@
     // « pending »/« error » jusqu'à une vraie vérification.
     if (!supa || !supaUser) { refreshUnpushed(); return; }
     recomputeDirty();
-    if (!unpushedChanges) { setSyncState("ok"); return; }
+    if (!unpushedChanges) { setSyncState(quarantineCount() ? "error" : "ok"); return; }
+    // v20 : il ne reste que des entités en quarantaine — rien à
+    // pousser, mais l'erreur reste VISIBLE (pas de « ✓ » mensonger).
+    if (!actionableCount()) { setSyncState("error"); return; }
     setSyncState("pending");
-    // Instantané du travail à faire + empreintes au départ : ce qui
-    // changera PENDANT la poussée (autre frappe, autre onglet)
-    // gardera une empreinte différente et restera « sale ».
-    const todoDays = new Set(dirtyDays), todoStops = new Set(dirtyStops), todoPhotos = new Set(dirtyPhotoStops);
+    // v20 : VERROU — une seule fenêtre pousse à la fois. Sans le
+    // verrou dans le délai, ce cycle n'écrit RIEN et se replanifie.
+    const gotLock = await acquireSyncLock();
+    if (!gotLock) { setSyncState("pending"); scheduleSyncRetry(); return; }
+    try { await pushCycleLocked(); }
+    finally { releaseSyncLock(); }
+  }
+  /* v20 : le cycle de poussée proprement dit, sous verrou.
+     Structure nouvelle : ISOLATION PAR ENTITÉ. Chaque phase
+     confirme ses entités une à une (le lot reste le chemin
+     rapide ; le repli individuel décide pour les entités que le
+     lot n'a pas confirmées) ; une entité en échec est comptée
+     (noteFailure -> quarantaine après 5) et reste « sale », mais
+     n'empêche plus JAMAIS les autres d'être confirmées ni le
+     cycle de se terminer. Seul un échec de LECTURE globale
+     (impossible de savoir ce que le serveur détient) avorte le
+     cycle entier, comme avant. */
+  async function pushCycleLocked() {
+    recomputeDirty();
+    // Instantané du travail à faire (HORS quarantaine) + empreintes
+    // au départ : ce qui changera PENDANT la poussée (autre frappe,
+    // autre onglet) gardera une empreinte différente et restera
+    // « sale ».
+    const todoDays = new Set([...dirtyDays].filter((k) => !quarantine.days[k]));
+    const todoStops = new Set([...dirtyStops].filter((k) => !quarantine.stops[k]));
+    const todoPhotos = new Set([...dirtyPhotoStops].filter((k) => !quarantine.photos[k]));
     const fpDay0 = new Map(), fpStop0 = new Map(), fpPhoto0 = new Map();
     todoDays.forEach((date) => { const d = DB.days.find((x) => x.date === date); if (d) fpDay0.set(date, dayFP(d)); });
     todoStops.forEach((id) => { const s = DB.stops.find((x) => x.id === id); if (s) fpStop0.set(id, stopFP(s)); });
     todoPhotos.forEach((sid) => { const s = DB.stops.find((x) => x.id === sid); fpPhoto0.set(sid, photoFP(s ? DB.photos[s.id] : [])); });
     const adoptedMap = {}; // ancien id local -> id serveur (arrêts hérités)
+    const okDays = new Set(), okStops = new Set(), okPhotos = new Set();
+    const failed = { days: new Set(), stops: new Set(), photos: new Set() };
+    const settledByDay = new Set(); // arrêts soldés localement par le garde-fou (règle c)
+    let cycleError = null;
+    let srvDayDeletedByDate = {};
     try {
-      // 1. Adresses des seuls arrêts concernés (les arrêts y font
-      // référence) — upsert VÉRIFIÉ par la ligne retournée.
+      // 0. v20 : lecture des journées serveur AVANT toute écriture
+      // (ids par date + suppressions) — sert à l'adoption d'id et
+      // au garde-fou corbeille plus bas.
+      const daysPre = await supa.from("days").select("id,date,deleted_at");
+      throwIfError("Lecture des journées", daysPre);
+      const srvDayIdByDate = {};
+      (daysPre.data || []).forEach((d) => {
+        srvDayIdByDate[d.date] = d.id;
+        srvDayDeletedByDate[d.date] = d.deleted_at ? Date.parse(d.deleted_at) : null;
+      });
+      // v20 : ADOPTION D'ID DE JOURNÉE. Deux fenêtres/appareils qui
+      // créent la MÊME date chacun de leur côté lui donnent deux id
+      // différents ; l'upsert (onConflict « date ») de la fenêtre
+      // perdante partait alors avec un id contredisant la clé de
+      // conflit — PostgREST rejette le lot ENTIER des journées,
+      // l'exception annulait tout le cycle, et la synchro bouclait
+      // sans jamais finir (l'autre symptôme du test de charge v19).
+      // Maintenant : si le serveur connaît déjà la date sous un
+      // autre id, l'appareil ADOPTE l'id serveur (les arrêts
+      // suivent), comme les arrêts le font depuis la v8.
+      (DB.days || []).forEach((d) => {
+        const srvId = srvDayIdByDate[d.date];
+        if (srvId && srvId !== d.id) {
+          const oldId = d.id;
+          d.id = srvId;
+          (DB.stops || []).forEach((s) => { if (s.dayId === oldId) s.dayId = srvId; });
+        }
+      });
+      // 1. Adresses des seuls arrêts concernés — upsert VÉRIFIÉ par
+      // la ligne retournée, ISOLÉ par adresse (v20) : une adresse
+      // qui échoue ne bloque que ses arrêts, pas le cycle.
       const workStops = DB.stops.filter((s) => todoStops.has(s.id) || todoPhotos.has(s.id));
       const addrIdByKey = {};
+      const failedAddrKeys = new Set();
       for (const s of workStops) {
-        if (!s.addressKey || addrIdByKey[s.addressKey]) continue;
-        const res = await supa.from("addresses").upsert(addrRowOf(s), { onConflict: "address_key" }).select("id,address_key").single();
-        throwIfError("Adresse", res);
-        if (!res.data || !res.data.id) throw new Error("Adresse : écriture non confirmée par le serveur");
-        addrIdByKey[s.addressKey] = res.data.id;
+        if (!s.addressKey || addrIdByKey[s.addressKey] || failedAddrKeys.has(s.addressKey)) continue;
+        try {
+          const res = await supa.from("addresses").upsert(addrRowOf(s), { onConflict: "address_key" }).select("id,address_key").single();
+          throwIfError("Adresse", res);
+          if (!res.data || !res.data.id) throw new Error("Adresse : écriture non confirmée par le serveur");
+          addrIdByKey[s.addressKey] = res.data.id;
+        } catch (e) {
+          failedAddrKeys.add(s.addressKey);
+          console.warn("Synchro : adresse non rendue ce cycle-ci (" + s.addressKey + ") — ses arrêts attendront le prochain cycle.", e);
+        }
       }
-      workStops.forEach((s) => { if (s.addressKey) s._addressId = addrIdByKey[s.addressKey]; });
+      workStops.forEach((s) => { if (s.addressKey && addrIdByKey[s.addressKey]) s._addressId = addrIdByKey[s.addressKey]; });
       // v17 : plus de pré-passage « suppressions d'abord » (v10-v16).
       // Chaque entité sale est écrite en LIGNE COMPLÈTE, deleted_at
       // compris, et vérifiée — une suppression est une modification
       // comme une autre, ni plus ni moins protégée.
-      // 2. Journées sales — lot unique, VÉRIFIÉ ligne par ligne :
-      // chaque ligne retournée doit porter exactement les valeurs
-      // envoyées (statut, optimisé, corbeille). C'est LE correctif
-      // central de la v17 : avant, l'upsert partait sans .select()
-      // et une écriture non appliquée passait pour un succès.
-      const dayRows = [];
+      // 2. Journées sales — lot VÉRIFIÉ ligne par ligne (v17 : chaque
+      // ligne retournée doit porter exactement les valeurs envoyées),
+      // puis v20 : REPLI INDIVIDUEL pour les journées que le lot n'a
+      // pas confirmées, et échec ISOLÉ pour celles qui échouent
+      // encore — elles ne bloquent plus les autres.
+      const dayRowByDate = new Map();
       for (const date of todoDays) {
         const d = DB.days.find((x) => x.date === date);
-        if (d) dayRows.push(dayRowOf(d)); else dirtyDays.delete(date); // disparue de la base : plus rien à écrire
+        if (!d) { dirtyDays.delete(date); continue; } // disparue de la base : plus rien à écrire
+        // v20 : GARDE-FOU CORBEILLE (journées) — une suppression ne
+        // part que si elle est EXPLICITE (geste de l'utilisateur,
+        // suivi par noteTrashTransitions) ou si le serveur a déjà
+        // cette journée à la corbeille. Sinon elle est BLOQUÉE et
+        // réparée localement : la journée revit sur l'appareil.
+        // Cas (e) : journée ABSENTE du serveur (purgée là-bas ou
+        // jamais rendue) — rien à protéger côté serveur : on solde
+        // localement SANS écrire et SANS ressusciter. Sans ce cas,
+        // la course purge/rechargement à l'amorçage (la purge
+        // supprime la ligne pendant que le rechargement la
+        // réimporte comme « locale seulement, sale ») faisait
+        // ressusciter les vieilles corbeilles purgées.
+        if (d.deletedAt && !explicitTrashDays.has(date) && !(date in srvDayDeletedByDate)) {
+          okDays.add(date);
+          continue;
+        }
+        if (d.deletedAt && !explicitTrashDays.has(date) && !srvDayDeletedByDate[date]) {
+          console.warn("Garde-fou corbeille : suppression de journée NON explicite bloquée (" + date + ") — journée restaurée localement, rien n'a été envoyé au serveur.");
+          if (window.WL_toast) { try { window.WL_toast("Suppression automatique bloquée : une journée a failli partir à la corbeille toute seule."); } catch (e) { /* affichage seulement */ } }
+          d.deletedAt = null;
+        }
+        dayRowByDate.set(date, dayRowOf(d));
       }
+      const dayRows = [...dayRowByDate.values()];
+      const verifyDayRow = (row, r) => {
+        if (!r) return false;
+        const delSent = row.deleted_at ? Date.parse(row.deleted_at) : null;
+        const delBack = r.deleted_at ? Date.parse(r.deleted_at) : null;
+        return r.status === row.status && !!r.optimized === !!row.optimized && delBack === delSent;
+      };
       if (dayRows.length) {
-        const res = await supa.from("days").upsert(dayRows, { onConflict: "date" }).select("id,date,status,optimized,deleted_at");
-        throwIfError("Journées", res);
-        const back = {};
-        (res.data || []).forEach((r) => { back[r.date] = r; });
+        try {
+          const res = await supa.from("days").upsert(dayRows, { onConflict: "date" }).select("id,date,status,optimized,deleted_at");
+          throwIfError("Journées", res);
+          const back = {};
+          (res.data || []).forEach((r) => { back[r.date] = r; });
+          dayRows.forEach((row) => { if (verifyDayRow(row, back[row.date])) okDays.add(row.date); });
+        } catch (e) { /* le repli individuel ci-dessous décide, journée par journée */ }
         for (const row of dayRows) {
-          const r = back[row.date];
-          if (!r) throw new Error("Journée " + row.date + " : écriture non confirmée par le serveur");
-          const delSent = row.deleted_at ? Date.parse(row.deleted_at) : null;
-          const delBack = r.deleted_at ? Date.parse(r.deleted_at) : null;
-          if (r.status !== row.status || !!r.optimized !== !!row.optimized || delBack !== delSent) {
-            throw new Error("Journée " + row.date + " : le serveur n'a pas les valeurs envoyées");
+          if (okDays.has(row.date)) continue;
+          try {
+            const res = await supa.from("days").upsert([row], { onConflict: "date" }).select("id,date,status,optimized,deleted_at");
+            throwIfError("Journée " + row.date, res);
+            if (!verifyDayRow(row, (res.data || [])[0])) throw new Error("Journée " + row.date + " : le serveur n'a pas les valeurs envoyées");
+            okDays.add(row.date);
+          } catch (e) {
+            failed.days.add(row.date);
+            noteFailure("days", row.date);
+            console.warn("Synchro : journée non rendue ce cycle-ci (" + row.date + ") — les autres continuent.", e);
           }
         }
       }
@@ -894,17 +1268,84 @@
       const daysNowRes = await supa.from("days").select("id,date");
       throwIfError("Lecture des journées", daysNowRes);
       (daysNowRes.data || []).forEach((d) => { dayIdByDate[d.date] = d.id; });
-      // 3. Arrêts sales — lots de 50, VÉRIFIÉS ligne par ligne sur
-      // des champs témoins (téléphone, position, eta, corbeille) :
-      // si le serveur n'a pas appliqué l'écriture, la ligne
-      // retournée le trahit et tout le cycle échoue (voir plus bas).
+      // 3. Arrêts sales — d'abord le GARDE-FOU CORBEILLE (v20).
+      // Une suppression (deleted_at) ne part au serveur que si :
+      //  (a) elle est EXPLICITE — geste de l'utilisateur suivi par
+      //      noteTrashTransitions (et persisté) ; ou
+      //  (b) le serveur a DÉJÀ cet arrêt à la corbeille —
+      //      confirmation idempotente (suppression faite sur un
+      //      autre appareil, apprise par rechargement) ; ou
+      //  (c) sa JOURNÉE est à la corbeille AU SERVEUR — l'arrêt
+      //      suit sa journée : on ne pousse RIEN pour lui, son état
+      //      local est soldé sans écriture (la règle de fusion v10
+      //      le maintient corbeillé tant que la journée l'est ; si
+      //      la journée est restaurée, ses champs repartiront
+      //      normalement à la prochaine modification) ; ou
+      //  (e) l'arrêt est ABSENT du serveur (purgé là-bas, ou créé
+      //      hors ligne et corbeillé avant sa première synchro) :
+      //      rien à protéger côté serveur — soldé localement SANS
+      //      écrire et SANS ressusciter. Ce cas ferme la course
+      //      purge/rechargement à l'amorçage : purgeTrash supprime
+      //      la ligne serveur d'une vieille corbeille pendant que
+      //      le rechargement initial la réimporte comme « locale
+      //      seulement, sale » — sans (e), le garde-fou la
+      //      ressuscitait et la purge ne finissait jamais.
+      // Sinon — arrêt vivant au serveur, journée vivante, aucune
+      // suppression explicite — la suppression est un FANTÔME :
+      // elle est BLOQUÉE et réparée localement (l'arrêt revit sur
+      // l'appareil), jamais appliquée au serveur.
+      // LE CHEMIN DU BUG V19 : au test de charge, 16 arrêts
+      // « Charge » sont passés à la corbeille tout seuls et les
+      // restaurations étaient annulées à chaque rechargement.
+      // Mécanisme (fenêtre périmée + règles d'avant v20) : une
+      // deuxième fenêtre restée ouverte gardait en mémoire des
+      // journées corbeillées lors d'un nettoyage antérieur ; sa
+      // poussée les rendait au serveur ; à la fusion, la règle
+      // v10 (« un arrêt dont la journée est supprimée est supprimé
+      // aussi ») corbeillait LOCALEMENT tous les arrêts de ces
+      // journées ; ces arrêts devenaient « sales » et la poussée
+      // suivante écrivait leurs deleted_at au serveur — suppression
+      // permanente, sans aucun geste de l'utilisateur. Et quand
+      // l'utilisateur restaurait un arrêt dans la fenêtre active,
+      // la fenêtre périmée persistait SA base fusionnée (arrêt
+      // encore corbeillé) dans le stockage local partagé avant que
+      // la restauration soit poussée : au rechargement suivant, la
+      // restauration avait disparu des deux copies. Le verrou
+      // (plus haut) empêche les poussées parallèles ; ce garde-fou
+      // ferme la porte aux suppressions fantômes elles-mêmes,
+      // quelle que soit leur source.
+      const trashedCandidates = workStops.filter((s) => todoStops.has(s.id) && s.deletedAt);
+      const srvStopDeleted = {};
+      if (trashedCandidates.length) {
+        const ids = trashedCandidates.map((s) => s.id).filter((id) => uuidOk(id));
+        if (ids.length) {
+          const r = await supa.from("stops").select("id,deleted_at").in("id", ids);
+          throwIfError("Corbeille (lecture serveur)", r);
+          (r.data || []).forEach((row) => { srvStopDeleted[row.id] = row.deleted_at ? Date.parse(row.deleted_at) : null; });
+        }
+      }
+      for (const s of trashedCandidates) {
+        if (explicitTrashStops.has(s.id)) continue; // (a) explicite
+        if (srvStopDeleted[s.id]) continue;         // (b) déjà corbeillé au serveur
+        if (!(s.id in srvStopDeleted)) { settledByDay.add(s.id); continue; } // (e) ABSENT du serveur : soldé localement, sans écrire ni ressusciter (course purge/rechargement — voir le cas (e) des journées)
+        const day = DB.days.find((x) => x.id === s.dayId);
+        if (day && srvDayDeletedByDate[day.date]) { settledByDay.add(s.id); continue; } // (c) suit sa journée
+        console.warn("Garde-fou corbeille : suppression d'arrêt NON explicite bloquée (" + s.id + ", " + (s.client || "") + ") — arrêt restauré localement, rien n'a été envoyé au serveur.");
+        if (window.WL_toast) { try { window.WL_toast("Suppression automatique bloquée : un arrêt a failli partir à la corbeille tout seul."); } catch (e) { /* affichage seulement */ } }
+        s.deletedAt = null; // réparation locale : l'arrêt revit et repart vivant ce cycle-ci
+      }
+      // Lots de 50, VÉRIFIÉS ligne par ligne sur des champs témoins
+      // (téléphone, position, eta, corbeille) — v20 : repli
+      // individuel + échec isolé, comme pour les journées.
       const stopRows = [];
       const legacyStops = [];
-      const blockedStops = []; // journée inconnue du serveur : on saute l'arrêt ce cycle-ci (il reste « sale »), sans bloquer les autres
+      const blockedStops = []; // journée inconnue du serveur : l'arrêt attend (compté en échec, quarantaine possible si sa journée est elle-même en quarantaine)
       for (const s of workStops) {
         if (!todoStops.has(s.id)) continue;
+        if (settledByDay.has(s.id)) continue; // soldé par le garde-fou (c) : aucune écriture
+        if (s.addressKey && failedAddrKeys.has(s.addressKey)) { failed.stops.add(s.id); noteFailure("stops", s.id); continue; }
         const day = DB.days.find((x) => x.id === s.dayId);
-        if (!day || !dayIdByDate[day.date]) { blockedStops.push(s.id); continue; }
+        if (!day || !dayIdByDate[day.date]) { blockedStops.push(s.id); failed.stops.add(s.id); noteFailure("stops", s.id); continue; }
         const row = stopRowOf(s, dayIdByDate[day.date], s._addressId || null);
         if (row.phone == null) row.phone = null;       // clés toujours présentes dans le lot
         if (row.eta_min == null) row.eta_min = null;   // (sinon PostgREST peut ignorer la colonne)
@@ -914,27 +1355,49 @@
       for (const { s, row } of legacyStops) {
         // v8 : ancien identifiant local — insertion UNE fois, puis
         // adoption de l'identifiant serveur retourné et VÉRIFIÉ.
-        const res = await supa.from("stops").insert(row).select("id").single();
-        throwIfError("Arrêt (insertion)", res);
-        if (!res.data || !res.data.id) throw new Error("Arrêt : insertion non confirmée par le serveur");
-        adoptedMap[s.id] = res.data.id;
-        adoptStopId(s, res.data.id);
+        // v20 : isolée — un échec ne bloque plus les autres arrêts.
+        const id0 = s.id;
+        try {
+          const res = await supa.from("stops").insert(row).select("id").single();
+          throwIfError("Arrêt (insertion)", res);
+          if (!res.data || !res.data.id) throw new Error("Arrêt : insertion non confirmée par le serveur");
+          adoptedMap[id0] = res.data.id;
+          adoptStopId(s, res.data.id);
+          okStops.add(id0);
+        } catch (e) {
+          failed.stops.add(id0);
+          noteFailure("stops", id0);
+          console.warn("Synchro : arrêt (insertion) non rendu ce cycle-ci (" + id0 + ").", e);
+        }
       }
+      const verifyStopRow = (row, r) => {
+        if (!r) return false;
+        const delSent = row.deleted_at ? Date.parse(row.deleted_at) : null;
+        const delBack = r.deleted_at ? Date.parse(r.deleted_at) : null;
+        return (r.phone || null) === (row.phone || null) && r.position === row.position &&
+          (r.eta_min != null ? r.eta_min : null) === (row.eta_min != null ? row.eta_min : null) &&
+          delBack === delSent;
+      };
       for (let i = 0; i < stopRows.length; i += 50) {
         const chunk = stopRows.slice(i, i + 50);
-        const res = await supa.from("stops").upsert(chunk, { onConflict: "id" }).select("id,phone,position,eta_min,deleted_at");
-        throwIfError("Arrêts", res);
-        const back = {};
-        (res.data || []).forEach((r) => { back[r.id] = r; });
+        try {
+          const res = await supa.from("stops").upsert(chunk, { onConflict: "id" }).select("id,phone,position,eta_min,deleted_at");
+          throwIfError("Arrêts", res);
+          const back = {};
+          (res.data || []).forEach((r) => { back[r.id] = r; });
+          chunk.forEach((row) => { if (verifyStopRow(row, back[row.id])) okStops.add(row.id); });
+        } catch (e) { /* le repli individuel ci-dessous décide, arrêt par arrêt */ }
         for (const row of chunk) {
-          const r = back[row.id];
-          if (!r) throw new Error("Arrêt " + row.id + " : écriture non confirmée par le serveur");
-          const delSent = row.deleted_at ? Date.parse(row.deleted_at) : null;
-          const delBack = r.deleted_at ? Date.parse(r.deleted_at) : null;
-          if ((r.phone || null) !== (row.phone || null) || r.position !== row.position ||
-              (r.eta_min != null ? r.eta_min : null) !== (row.eta_min != null ? row.eta_min : null) ||
-              delBack !== delSent) {
-            throw new Error("Arrêt " + row.id + " : le serveur n'a pas les valeurs envoyées");
+          if (okStops.has(row.id)) continue;
+          try {
+            const res = await supa.from("stops").upsert([row], { onConflict: "id" }).select("id,phone,position,eta_min,deleted_at");
+            throwIfError("Arrêt " + row.id, res);
+            if (!verifyStopRow(row, (res.data || [])[0])) throw new Error("Arrêt " + row.id + " : le serveur n'a pas les valeurs envoyées");
+            okStops.add(row.id);
+          } catch (e) {
+            failed.stops.add(row.id);
+            noteFailure("stops", row.id);
+            console.warn("Synchro : arrêt non rendu ce cycle-ci (" + row.id + ") — les autres continuent.", e);
           }
         }
       }
@@ -953,6 +1416,8 @@
         if (!s) { dirtyPhotoStops.delete(sid0); continue; }
         if (!uuidOk(s.id)) continue; // pas encore d'id serveur : restera sale, repartira après l'insertion de l'arrêt
         if (blockedStops.indexOf(s.id) !== -1) continue; // journée absente du serveur : même sort que l'arrêt (voir étape 3)
+        if (failed.stops.has(sid0) || failed.stops.has(s.id)) continue; // v20 : l'arrêt n'est pas rendu ce cycle-ci — ses photos attendront, sans compter comme un échec photo
+        try {
         const local = DB.photos[s.id] || [];
         const readSrvPhotos = async () => {
           const r = await supa.from("photos").select("id,data_url").eq("stop_id", s.id);
@@ -989,53 +1454,80 @@
           const lp = local.find((x) => x.dataUrl === sp.data_url);
           if (lp && lp.id !== sp.id) lp.id = sp.id;
         });
+        okPhotos.add(sid0);
+        } catch (e) {
+          // v20 : échec ISOLÉ aux photos de CET arrêt — compté,
+          // quarantaine possible, les autres arrêts continuent.
+          failed.photos.add(sid0);
+          noteFailure("photos", sid0);
+          console.warn("Synchro : photos non rendues ce cycle-ci (arrêt " + sid + ") — les autres continuent.", e);
+        }
       }
       persistLocal(); // garder les identifiants de photos adoptés
-      // 5. On n'arrive ici que si TOUTES les écritures du cycle ont
-      // été VÉRIFIÉES. Seulement là, les entités poussées sortent
-      // des ensembles « sales » et leurs empreintes « propres »
-      // avancent — et seulement si leur empreinte n'a pas changé
-      // pendant la poussée (sinon elles restent sales et repartent).
-      todoDays.forEach((date) => {
-        const d = DB.days.find((x) => x.date === date);
-        if (!d) { dirtyDays.delete(date); return; }
-        if (fpDay0.has(date) && dayFP(d) === fpDay0.get(date)) { cleanDays.set(date, fpDay0.get(date)); dirtyDays.delete(date); }
-      });
-      todoStops.forEach((id0) => {
-        const id = adoptedMap[id0] || id0;
-        const s = DB.stops.find((x) => x.id === id);
-        if (!s) { dirtyStops.delete(id0); dirtyStops.delete(id); return; }
-        if (fpStop0.has(id0) && stopFP(s) === fpStop0.get(id0)) { cleanStops.set(id, fpStop0.get(id0)); dirtyStops.delete(id0); dirtyStops.delete(id); }
-      });
-      todoPhotos.forEach((sid0) => {
-        const sid = adoptedMap[sid0] || sid0;
-        const s = DB.stops.find((x) => x.id === sid);
-        if (!s) { dirtyPhotoStops.delete(sid0); dirtyPhotoStops.delete(sid); return; }
-        if (!uuidOk(s.id)) return; // jamais parti : reste sale
-        if (fpPhoto0.has(sid0) && photoFP(DB.photos[sid]) === fpPhoto0.get(sid0)) {
-          cleanPhotos.set(sid, fpPhoto0.get(sid0)); dirtyPhotoStops.delete(sid0); dirtyPhotoStops.delete(sid);
-        }
-      });
-      persistSyncMeta();
-      persistLocal();
-      refreshUnpushed();
-      if (blockedStops.length) {
-        // Des arrêts n'ont pas pu partir (journée absente du
-        // serveur) : état d'erreur honnête + nouvel essai espacé,
-        // le reste du cycle, lui, est bel et bien rendu.
-        console.warn("Synchro incomplète — arrêts sans journée au serveur :", blockedStops);
-        setSyncState("error");
-        scheduleSyncRetry();
-      }
-      else if (unpushedChanges) { setSyncState("pending"); pushSupabaseSoon(); } // il reste du travail (changé pendant la poussée)
-      else setSyncState("ok");
-      pushSnapshotSupabase(); // v16 : en arrière-plan — ne bloque plus la poussée
     } catch (e) {
-      console.warn("Synchro Supabase ÉCHOUÉE — les données restent sur l'appareil, nouvel essai automatique.", e);
+      // Échec de CYCLE (une lecture globale impossible : on ne sait
+      // plus ce que le serveur détient) — rien n'est tenu pour
+      // rendu au-delà des confirmations déjà obtenues ci-dessous,
+      // nouvel essai automatique, comme avant la v20.
+      cycleError = e;
+      console.warn("Synchro Supabase interrompue — les données restent sur l'appareil, nouvel essai automatique.", e);
+    }
+    // 5. Nettoyage : seules les entités CONFIRMÉES ce cycle-ci
+    // sortent des ensembles « sales » et voient leur empreinte
+    // « propre » avancer — et seulement si leur empreinte n'a pas
+    // changé pendant la poussée (sinon elles restent sales et
+    // repartent). v20 : les entités en échec isolé restent sales
+    // (quarantaine éventuelle) sans retenir les autres.
+    todoDays.forEach((date) => {
+      const d = DB.days.find((x) => x.date === date);
+      if (!d) { dirtyDays.delete(date); return; }
+      if (!okDays.has(date)) return;
+      if (fpDay0.has(date) && dayFP(d) === fpDay0.get(date)) { cleanDays.set(date, fpDay0.get(date)); dirtyDays.delete(date); noteSuccess("days", date); }
+    });
+    todoStops.forEach((id0) => {
+      const id = adoptedMap[id0] || id0;
+      const s = DB.stops.find((x) => x.id === id);
+      if (!s) { dirtyStops.delete(id0); dirtyStops.delete(id); return; }
+      if (settledByDay.has(id0) || settledByDay.has(id)) {
+        // Soldé par le garde-fou (c) : aucune écriture serveur,
+        // l'état local fait foi tant que la journée est corbeillée
+        // au serveur (la fusion le maintient à chaque rechargement).
+        cleanStops.set(id, stopFP(s)); dirtyStops.delete(id0); dirtyStops.delete(id);
+        return;
+      }
+      if (!okStops.has(id0) && !okStops.has(id)) return;
+      if (fpStop0.has(id0) && stopFP(s) === fpStop0.get(id0)) {
+        cleanStops.set(id, fpStop0.get(id0)); dirtyStops.delete(id0); dirtyStops.delete(id); noteSuccess("stops", id);
+        // Suppression confirmée par le serveur : le sauf-conduit
+        // explicite n'est plus nécessaire (la règle (b) couvre la
+        // suite : le serveur a déjà l'arrêt à la corbeille).
+        if (s.deletedAt) { explicitTrashStops.delete(id0); explicitTrashStops.delete(id); }
+      }
+    });
+    todoPhotos.forEach((sid0) => {
+      if (!okPhotos.has(sid0)) return;
+      const sid = adoptedMap[sid0] || sid0;
+      const s = DB.stops.find((x) => x.id === sid);
+      if (!s) { dirtyPhotoStops.delete(sid0); dirtyPhotoStops.delete(sid); return; }
+      if (!uuidOk(s.id)) return; // jamais parti : reste sale
+      if (fpPhoto0.has(sid0) && photoFP(DB.photos[sid]) === fpPhoto0.get(sid0)) {
+        cleanPhotos.set(sid, fpPhoto0.get(sid0)); dirtyPhotoStops.delete(sid0); dirtyPhotoStops.delete(sid); noteSuccess("photos", sid);
+      }
+    });
+    persistSyncMeta();
+    persistLocal();
+    refreshUnpushed();
+    if (cycleError || failed.days.size || failed.stops.size || failed.photos.size) {
+      // Au moins un échec ce cycle-ci : état d'erreur honnête +
+      // nouvel essai espacé. Les entités confirmées, elles, sont
+      // bel et bien rendues (nettoyées ci-dessus).
       setSyncState("error");
       scheduleSyncRetry();
-      persistLocal(); // filet de sécurité local même en mode Supabase
     }
+    else if (actionableCount() > 0) { setSyncState("pending"); pushSupabaseSoon(); } // il reste du travail (changé pendant la poussée)
+    else if (quarantineCount() > 0) setSyncState("error"); // v20 : quarantaine restante = erreur visible
+    else setSyncState("ok");
+    pushSnapshotSupabase(); // v16 : en arrière-plan — ne bloque plus la poussée
   }
 
   let supaSnapDay = "";
@@ -1089,8 +1581,19 @@
     if (oldDays.length) DB.days = DB.days.filter((d) => !oldDays.includes(d));
     if (oldStops.length || oldDays.length) {
       // v17 : les entités purgées sortent aussi du suivi de synchro.
-      oldStops.forEach((s) => { dirtyStops.delete(s.id); dirtyPhotoStops.delete(s.id); cleanStops.delete(s.id); cleanPhotos.delete(s.id); });
-      oldDays.forEach((d) => { dirtyDays.delete(d.date); cleanDays.delete(d.date); });
+      // v20 : idem pour la quarantaine, les compteurs et les
+      // sauf-conduits corbeille.
+      oldStops.forEach((s) => {
+        dirtyStops.delete(s.id); dirtyPhotoStops.delete(s.id); cleanStops.delete(s.id); cleanPhotos.delete(s.id);
+        delete quarantine.stops[s.id]; delete quarantine.photos[s.id];
+        delete failCounts.stops[s.id]; delete failCounts.photos[s.id];
+        explicitTrashStops.delete(s.id); knownDeletedStops.delete(s.id);
+      });
+      oldDays.forEach((d) => {
+        dirtyDays.delete(d.date); cleanDays.delete(d.date);
+        delete quarantine.days[d.date]; delete failCounts.days[d.date];
+        explicitTrashDays.delete(d.date); knownDeletedDays.delete(d.date);
+      });
       persistLocal();
       persistSyncMeta();
       refreshUnpushed();
@@ -1160,6 +1663,12 @@
       days: obj.days, stops: obj.stops, photos: obj.photos || {}
     };
     dedupeDays();
+    // v20 : une restauration est un geste explicite de
+    // l'utilisateur — les suppressions qu'elle contient sont
+    // légitimes aux yeux du garde-fou corbeille.
+    (DB.days || []).forEach((d) => { if (d.deletedAt) explicitTrashDays.add(d.date); });
+    (DB.stops || []).forEach((s) => { if (s.deletedAt) explicitTrashStops.add(s.id); });
+    refreshKnownDeleted();
     // v17 : tout le contenu restauré est « sale » — il sera poussé
     // et vérifié comme du neuf.
     cleanDays.clear(); cleanStops.clear(); cleanPhotos.clear();
@@ -1228,11 +1737,25 @@
     },
     saveNow() { // synchro immédiate (ex. avant de quitter l'écran)
       persistLocal();
-      if (MODE === "supabase") { recomputeDirty(); persistSyncMeta(); setSyncState("pending"); pushSupabaseNow(); }
+      if (MODE === "supabase") {
+        // v20 : une demande de synchro explicite redonne une chance
+        // immédiate aux entités en quarantaine. Leurs compteurs
+        // d'échecs sont CONSERVÉS : si l'écriture échoue encore, la
+        // quarantaine revient dès ce premier échec — pas de boucle.
+        quarantine = { days: {}, stops: {}, photos: {} };
+        recomputeDirty(); persistSyncMeta(); setSyncState("pending"); pushSupabaseNow();
+      }
     },
     /* v16 : l'interface affiche l'état réel de la synchro. */
     setSyncListener(fn) { onSyncState = fn; if (fn) { try { fn(syncState); } catch (e) { /* affichage */ } } },
     get syncState() { return syncState; },
+    /* v20 : diagnostics — cette fenêtre détient-elle le verrou de
+       synchro, et quelles entités sont en quarantaine (l'état
+       « error » visible dans l'en-tête les reflète). */
+    get syncLockHeld() { return syncLockHeld; },
+    get syncErrors() {
+      return { days: Object.keys(quarantine.days), stops: Object.keys(quarantine.stops), photos: Object.keys(quarantine.photos) };
+    },
     async removeDay(id) { await deleteRemote("days", id); },
     async removeStop(id) { await deleteRemote("stops", id); },
     exportJSON,
