@@ -311,6 +311,31 @@
     return supaUser;
   }
 
+  /* v22 : LECTURES PAGINÉES — PostgREST plafonne chaque réponse
+     (db-max-rows, 1000 par défaut chez Supabase) : une lecture
+     sans range() est TRONQUÉE en silence au-delà de la limite.
+     Prouvé par run28 (P3) : la lecture des identifiants photos
+     du rechargement, tronquée à 1000 lignes, faisait croire à
+     un seau serveur vide pour l'arrêt dont la photo était la
+     1006e ligne ; refreshCleanFromDB effaçait alors son
+     empreinte propre, la photo devenait invisible — et dès
+     l'ajout d'une autre photo, la réconciliation par arrêt
+     EFFAÇAIT l'originale du serveur pour de bon. On lit donc
+     par pages de 1000 (range) jusqu'à une page courte, pour
+     toutes les lectures en bloc : journées, arrêts, adresses,
+     identifiants photos et téléchargements de photos. */
+  const READ_PAGE = 1000;
+  async function selectAllPages(build) {
+    const all = [];
+    for (let from = 0; ; from += READ_PAGE) {
+      const r = await build(from, from + READ_PAGE - 1);
+      if (r.error) return { data: null, error: r.error };
+      const rows = r.data || [];
+      for (const row of rows) all.push(row);
+      if (rows.length < READ_PAGE) return { data: all, error: null };
+    }
+  }
+
   async function reloadFromSupabase() {
     // v20 : pendant toute la fusion, merging = true — les
     // suppressions qui apparaissent dans la base fusionnée ne
@@ -322,11 +347,11 @@
     // jamais marquée propre (voir son commentaire).
     const preDirty = { days: new Set(dirtyDays), stops: new Set(dirtyStops), photos: new Set(dirtyPhotoStops) };
     const [daysR, stopsR, photosR, profR, addrR] = await Promise.all([
-      supa.from("days").select("*").order("date"),
-      supa.from("stops").select("*").order("position"),
-      supa.from("photos").select("id, stop_id, address_id, created_at"), // v15 : sans data_url (le volume) — voir plus bas
+      selectAllPages((a, b) => supa.from("days").select("*").order("date").range(a, b)), // v22 : paginé (limite PostgREST)
+      selectAllPages((a, b) => supa.from("stops").select("*").order("position").range(a, b)), // v22 : paginé
+      selectAllPages((a, b) => supa.from("photos").select("id, stop_id, address_id, created_at").range(a, b)), // v15 : sans data_url (le volume) — voir plus bas ; v22 : paginé
       supa.from("profiles").select("*"),
-      supa.from("addresses").select("*") // v16 : en parallèle (avant : un aller-retour de plus en série)
+      selectAllPages((a, b) => supa.from("addresses").select("*").range(a, b)) // v16 : en parallèle (avant : un aller-retour de plus en série) ; v22 : paginé
     ]);
     // v17 : les erreurs de LECTURE sont enfin vérifiées ici. Avant,
     // un échec (réseau, session expirée) donnait data = null, traité
@@ -395,7 +420,7 @@
     });
     let fullPhotos = [];
     if (changedStopIds.length) {
-      const r = await supa.from("photos").select("*").in("stop_id", changedStopIds);
+      const r = await selectAllPages((a, b) => supa.from("photos").select("*").in("stop_id", changedStopIds).range(a, b)); // v22 : paginé
       if (r.error) { // v17 : abandonner plutôt que de tronquer les photos
         console.warn("Rechargement abandonné (photos illisibles).", r.error);
         merging = false;
@@ -404,7 +429,7 @@
       fullPhotos = r.data || [];
     }
     if (legacyPhotoIds.length) {
-      const r = await supa.from("photos").select("*").in("id", legacyPhotoIds);
+      const r = await selectAllPages((a, b) => supa.from("photos").select("*").in("id", legacyPhotoIds).range(a, b)); // v22 : paginé
       if (r.error) {
         console.warn("Rechargement abandonné (photos illisibles).", r.error);
         merging = false;
@@ -1190,7 +1215,7 @@
       // 0. v20 : lecture des journées serveur AVANT toute écriture
       // (ids par date + suppressions) — sert à l'adoption d'id et
       // au garde-fou corbeille plus bas.
-      const daysPre = await supa.from("days").select("id,date,deleted_at");
+      const daysPre = await selectAllPages((a, b) => supa.from("days").select("id,date,deleted_at").range(a, b)); // v22 : paginé
       throwIfError("Lecture des journées", daysPre);
       const srvDayIdByDate = {};
       (daysPre.data || []).forEach((d) => {
@@ -1302,7 +1327,7 @@
       // Carte complète des identifiants de journées (les arrêts y
       // font référence) — relue, jamais supposée.
       const dayIdByDate = {};
-      const daysNowRes = await supa.from("days").select("id,date");
+      const daysNowRes = await selectAllPages((a, b) => supa.from("days").select("id,date").range(a, b)); // v22 : paginé
       throwIfError("Lecture des journées", daysNowRes);
       (daysNowRes.data || []).forEach((d) => { dayIdByDate[d.date] = d.id; });
       // 3. Arrêts sales — d'abord le GARDE-FOU CORBEILLE (v20).
@@ -1455,7 +1480,32 @@
         if (blockedStops.indexOf(s.id) !== -1) continue; // journée absente du serveur : même sort que l'arrêt (voir étape 3)
         if (failed.stops.has(sid0) || failed.stops.has(s.id)) continue; // v20 : l'arrêt n'est pas rendu ce cycle-ci — ses photos attendront, sans compter comme un échec photo
         try {
-        if (photoUnknownStops.has(s.id)) {
+        // v22 : le réimport d'abord s'impose dans DEUX cas —
+        // (1) le drapeau v21 (copie allégée : empreinte propre
+        // non vide, seau vide) ; (2) NOUVEAU : seau local vide
+        // ET AUCUNE empreinte propre non vide pour cet arrêt.
+        // Le cas (2) est le trou résiduel du test de charge réel
+        // v21 (1 photo perdue sur 63), prouvé par run28 (P2) :
+        // la photo avait été poussée et confirmée EN MÉMOIRE,
+        // mais l'écriture du méta qui persiste cette
+        // confirmation a été refusée (quota — persistSyncMeta
+        // avale l'échec en silence) ; au redémarrage, l'arrêt
+        // était « photos sales » SANS empreinte propre (le
+        // drapeau v21, qui exige une empreinte, ne pouvait pas
+        // être posé), la copie allégée n'avait pas sa photo, et
+        // la phase prenait le seau vide pour une suppression :
+        // elle a EFFACÉ la photo du serveur, puis « vérifié »
+        // vide = vide — perte permanente sous « ✓ Synchronisé ».
+        // Règle v22 : un seau vide ne prouve une suppression que
+        // si cet appareil a déjà CONFIRMÉ un ensemble non vide
+        // (empreinte propre non vide) — c'est le cas de la vraie
+        // suppression (geste fait sur des photos visibles, donc
+        // connues et confirmées, run27 (E)). Sinon, le seau est
+        // INCONNU, pas vide : réimporter d'abord (union), comme
+        // pour le drapeau. Si le serveur n'a rien, l'union
+        // n'ajoute rien et le calcul continue normalement.
+        const bucketNow0 = (DB.photos || {})[s.id] || [];
+        if (photoUnknownStops.has(s.id) || (!bucketNow0.length && !cleanPhotos.get(s.id))) {
           // v21 : arrêt chargé depuis une copie locale ALLÉGÉE
           // (quota) : ses photos serveur ne sont pas dans le seau
           // local. Les réimporter AVANT tout calcul — sinon la
@@ -1800,23 +1850,31 @@
     get data() { return DB; },
     /* À appeler après CHAQUE modification : écriture immédiate. */
     save() {
-      persistLocal();
       // v17 : chaque sauvegarde recalcule les ensembles « sales »
       // (empreintes) et les persiste AVANT de planifier la poussée —
       // une modification est donc suivie explicitement, jamais
       // déduite d'une comparaison rejouée plus tard.
-      if (MODE === "supabase") { recomputeDirty(); persistSyncMeta(); setSyncState("pending"); pushSupabaseSoon(); }
+      // v22 : recomputeDirty() AVANT persistLocal() — avant, la
+      // copie locale était écrite avec les ensembles « sales »
+      // d'AVANT la modification : sous quota, la copie ALLÉGÉE
+      // jetait la photo qui venait d'être ajoutée (son arrêt
+      // n'était pas encore marqué « photos sales »), et si la
+      // confirmation du méta se perdait ensuite, plus rien ne
+      // protégeait cette photo au redémarrage (voir la phase
+      // photos de pushCycleLocked, garde-fou v22).
+      if (MODE === "supabase") { recomputeDirty(); persistLocal(); persistSyncMeta(); setSyncState("pending"); pushSupabaseSoon(); }
+      else persistLocal();
     },
     saveNow() { // synchro immédiate (ex. avant de quitter l'écran)
-      persistLocal();
       if (MODE === "supabase") {
         // v20 : une demande de synchro explicite redonne une chance
         // immédiate aux entités en quarantaine. Leurs compteurs
         // d'échecs sont CONSERVÉS : si l'écriture échoue encore, la
         // quarantaine revient dès ce premier échec — pas de boucle.
         quarantine = { days: {}, stops: {}, photos: {} };
-        recomputeDirty(); persistSyncMeta(); setSyncState("pending"); pushSupabaseNow();
-      }
+        // v22 : même ordre que save() — recalculer avant d'écrire.
+        recomputeDirty(); persistLocal(); persistSyncMeta(); setSyncState("pending"); pushSupabaseNow();
+      } else persistLocal();
     },
     /* v16 : l'interface affiche l'état réel de la synchro. */
     setSyncListener(fn) { onSyncState = fn; if (fn) { try { fn(syncState); } catch (e) { /* affichage */ } } },
