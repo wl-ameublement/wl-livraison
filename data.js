@@ -449,26 +449,44 @@
       if (srv !== loc) changedStopIds.push(sid);
     });
     let fullPhotos = [];
-    if (changedStopIds.length) {
-      const r = await selectAllPages((a, b) => supa.from("photos").select("*").in("stop_id", changedStopIds).range(a, b)); // v22 : paginé
-      if (r.error) { // v17 : abandonner plutôt que de tronquer les photos
-        console.warn("Rechargement abandonné (photos illisibles).", r.error);
-        merging = false;
-        setSyncState("error"); scheduleSyncRetry(); return;
-      }
-      fullPhotos = r.data || [];
-    }
-    if (legacyPhotoIds.length) {
-      const r = await selectAllPages((a, b) => supa.from("photos").select("*").in("id", legacyPhotoIds).range(a, b)); // v22 : paginé
+    // v24 : téléchargement par PETITS LOTS d'arrêts (8 à la fois).
+    // Avant, UNE requête .in() géante partait pour tous les arrêts
+    // changés : la moindre erreur avortait TOUT le rechargement et
+    // l'app restait sur la copie allégée (0 photo affichée le
+    // 23 nov. alors que le serveur les détenait). Un lot en échec
+    // est désormais ISOLÉ : ses arrêts gardent leur seau local
+    // (jamais un seau « vide » par erreur), ne sont pas certifiés
+    // propres (empreinte sentinelle plus bas) et une relance du
+    // rechargement est programmée en fin de fonction.
+    const photoDlFailed = new Set();
+    for (let i = 0; i < changedStopIds.length; i += 8) {
+      const batch = changedStopIds.slice(i, i + 8);
+      const r = await selectAllPages((a, b) => supa.from("photos").select("*").in("stop_id", batch).range(a, b)); // v22 : paginé
       if (r.error) {
-        console.warn("Rechargement abandonné (photos illisibles).", r.error);
-        merging = false;
-        setSyncState("error"); scheduleSyncRetry(); return;
+        console.warn("Rechargement : lot de photos illisible — seaux locaux conservés, relance programmée.", r.error);
+        batch.forEach((sid) => photoDlFailed.add(sid));
+        continue;
+      }
+      fullPhotos = fullPhotos.concat(r.data || []);
+    }
+    for (let i = 0; i < legacyPhotoIds.length; i += 200) {
+      const batch = legacyPhotoIds.slice(i, i + 200);
+      const r = await selectAllPages((a, b) => supa.from("photos").select("*").in("id", batch).range(a, b)); // v22 : paginé
+      if (r.error) {
+        // Rattachement purement additif : sauter un lot ne peut
+        // vider aucun seau ; les photos héritées manquées se
+        // rattacheront au prochain rechargement réussi.
+        console.warn("Rechargement : lot de photos héritées illisible — rattachement reporté.", r.error);
+        photoDlFailed.add("__legacy__");
+        continue;
       }
       fullPhotos = fullPhotos.concat(r.data || []);
     }
     next.stops.forEach((s) => {
-      if (changedStopIds.indexOf(s.id) === -1 && localPhotos[s.id] && (srvPhotoIdsByStop[s.id] || []).length) {
+      // v24 : un arrêt dont le lot a échoué conserve son seau local,
+      // exactement comme un arrêt inchangé.
+      const keepLocal = changedStopIds.indexOf(s.id) === -1 || photoDlFailed.has(s.id);
+      if (keepLocal && localPhotos[s.id] && (srvPhotoIdsByStop[s.id] || []).length) {
         next.photos[s.id] = localPhotos[s.id].slice();
       }
     });
@@ -513,6 +531,12 @@
       return [s.id, JSON.stringify(r)];
     }));
     const srvPhotoFPs = new Map(next.stops.map((s) => [s.id, photoFP(next.photos[s.id])]));
+    // v24 : les arrêts dont le lot de téléchargement a échoué
+    // reçoivent une empreinte serveur SENTINELLE — impossible à
+    // confondre avec une vraie empreinte : refreshCleanFromDB ne
+    // les certifiera pas « propres » (leur contenu serveur reste
+    // non vérifié jusqu'au rechargement de relance).
+    photoDlFailed.forEach((sid) => { if (srvPhotoFPs.has(sid)) srvPhotoFPs.set(sid, "__dl_failed__"); });
     // Préserver ce qui n'existe encore que sur cet appareil (créé hors
     // connexion ou pas encore poussé) : sans ça, le rechargement serveur
     // l'effacerait de l'écran — et de l'appareil — en silence.
@@ -669,6 +693,16 @@
     if (actionableCount() > 0) { setSyncState("pending"); pushSupabaseSoon(); } // envoyer la surcouche
     else if (quarantineCount() > 0) setSyncState("error"); // v20 : quarantaine = erreur visible, jamais « ✓ Synchronisé »
     else setSyncState("ok");
+    // v24 : des lots de photos n'ont pas pu être lus — ne jamais
+    // laisser « ✓ Synchronisé » : erreur visible par-dessus l'état
+    // ci-dessus et rechargement retenté automatiquement (les
+    // seaux concernés sont conservés en local, rien n'est perdu
+    // ni certifié à tort).
+    if (photoDlFailed.size) {
+      setSyncState("error");
+      clearTimeout(reloadRetryTimer);
+      reloadRetryTimer = setTimeout(() => { refreshRemote(); }, 5000);
+    }
   }
 
   function t2m(t) { // "10:30:00" -> 630
@@ -1138,6 +1172,7 @@
     if (onSyncState) { try { onSyncState(st); } catch (e) { /* affichage seulement */ } }
   }
   let syncRetryTimer = null;
+  let reloadRetryTimer = null; // v24 : relance d'un rechargement dont un lot de photos a échoué
   function scheduleSyncRetry() {
     if (syncRetryTimer) return;
     syncRetryTimer = setTimeout(() => {
@@ -1690,7 +1725,12 @@
           // l'empreinte de départ du cycle devient celle du seau
           // complété pour que le nettoyage de fin de cycle
           // puisse conclure dès ce cycle-ci.
-          const r0 = await supa.from("photos").select("id,data_url").eq("stop_id", s.id);
+          // v24 : PAGINÉ — la lecture eq() non paginée plafonnait
+          // à 1 000 lignes (PostgREST) : pour un arrêt qui en
+          // détient davantage, la phase travaillait sur une
+          // fenêtre aveugle (cœur du cliquet de duplication,
+          // prouvé par run36 — voir DIAG-v24).
+          const r0 = await selectAllPages((a, b) => supa.from("photos").select("id,data_url").eq("stop_id", s.id).range(a, b));
           throwIfError("Photos (réimport copie allégée)", r0);
           if (!DB.photos) DB.photos = {};
           const bucket0 = DB.photos[s.id] || (DB.photos[s.id] = []);
@@ -1701,40 +1741,76 @@
         }
         const local = DB.photos[s.id] || [];
         const readSrvPhotos = async () => {
-          const r = await supa.from("photos").select("id,data_url").eq("stop_id", s.id);
+          // v24 : PAGINÉ, comme le réimport ci-dessus — srvUrls
+          // et la vérification finale doivent voir TOUTES les
+          // lignes de l'arrêt. Sans pagination, une photo au-delà
+          // de la ligne 1 000 paraît absente : insertion en
+          // doublon à chaque cycle, et la vérification (relue par
+          // la même fenêtre) échoue pour toujours — l'arrêt reste
+          // « photos sales » et chaque relance ajoute une copie
+          // (run36, DIAG-v24).
+          const r = await selectAllPages((a, b) => supa.from("photos").select("id,data_url").eq("stop_id", s.id).range(a, b));
           throwIfError("Photos (lecture serveur)", r);
           return r.data || [];
         };
         let srv = await readSrvPhotos();
-        const srvUrls = new Set(srv.map((p) => p.data_url));
+        // v24 : appariement PAR EFFECTIF — chaque entrée du seau
+        // adopte une ligne serveur DISTINCTE de même URL ; une
+        // ligne n'est créée que pour une entrée sans ligne libre.
+        // (Avant : appariement par ENSEMBLE d'URL — deux entrées
+        // de la même photo adoptaient la même ligne, et surtout
+        // une URL « présente » masquait n'importe quel nombre de
+        // lignes.) La lecture étant complète (paginée), les
+        // comptes sont exacts : la phase est idempotente.
+        const srvIds = new Set(srv.map((p) => p.id));
+        const usedIds = new Set();
+        const paired = new Set(); // v24 : une ligne ne peut être revendiquée que par UNE entrée (des entrées héritées peuvent partager le même id serveur)
+        local.forEach((p) => { if (srvIds.has(p.id) && !usedIds.has(p.id)) { usedIds.add(p.id); paired.add(p); } });
+        const freeByUrl = new Map();
+        srv.forEach((p) => {
+          if (usedIds.has(p.id)) return;
+          const a = freeByUrl.get(p.data_url) || []; a.push(p); freeByUrl.set(p.data_url, a);
+        });
         for (const p of local) {
-          if (srvUrls.has(p.dataUrl)) {
-            const sp = srv.find((x) => x.data_url === p.dataUrl);
-            if (sp && p.id !== sp.id) p.id = sp.id; // adopter l'identifiant serveur
-            continue;
-          }
+          if (paired.has(p)) continue; // déjà appariée à sa ligne
+          const pool = freeByUrl.get(p.dataUrl) || [];
+          const sp = pool.shift();
+          if (sp) { p.id = sp.id; usedIds.add(sp.id); srvIds.add(sp.id); continue; } // adopter une ligne libre
           const insRes = await supa.from("photos").insert({
             stop_id: s.id, address_id: s._addressId || null, data_url: p.dataUrl
           }).select("id").single();
           throwIfError("Photo (envoi)", insRes);
           if (!insRes.data || !insRes.data.id) throw new Error("Photo : envoi non confirmé par le serveur");
           p.id = insRes.data.id;
-          srvUrls.add(p.dataUrl);
+          usedIds.add(p.id); srvIds.add(p.id);
         }
         const localUrls = new Set(local.map((p) => p.dataUrl));
+        // v24 : CONVERGENCE — toute ligne serveur non consommée
+        // par l'appariement ci-dessus est un surplus et part :
+        // URL absente du seau (comportement d'avant) OU doublon
+        // d'une URL présente au-delà de l'effectif du seau
+        // (nouveau). Avant la v24, ce deuxième cas n'était jamais
+        // supprimé — un tas, une fois formé, était éternel
+        // (8 284 copies sur un arrêt, 23 nov.). Avec la lecture
+        // paginée complète, la prochaine réconciliation d'un
+        // arrêt empilé le ramène exactement à son seau.
         for (const p of srv) {
-          if (!localUrls.has(p.data_url)) throwIfError("Photo (suppression)", await supa.from("photos").delete().eq("id", p.id));
+          if (usedIds.has(p.id)) continue;
+          throwIfError("Photo (suppression)", await supa.from("photos").delete().eq("id", p.id));
         }
-        // VÉRIFICATION FINALE : relire et comparer les ensembles.
+        // VÉRIFICATION FINALE : relire et comparer les ensembles
+        // ET les effectifs par URL (v24) — le serveur doit détenir
+        // exactement le seau local, ni plus ni moins.
         srv = await readSrvPhotos();
         const finalUrls = new Set(srv.map((p) => p.data_url));
-        if (finalUrls.size !== localUrls.size || [...localUrls].some((u) => !finalUrls.has(u))) {
+        const localCount = new Map();
+        local.forEach((p) => localCount.set(p.dataUrl, (localCount.get(p.dataUrl) || 0) + 1));
+        const finalCount = new Map();
+        srv.forEach((p) => finalCount.set(p.data_url, (finalCount.get(p.data_url) || 0) + 1));
+        const countMismatch = [...localCount].some(([u, n]) => (finalCount.get(u) || 0) !== n);
+        if (countMismatch || finalUrls.size !== localUrls.size || [...localUrls].some((u) => !finalUrls.has(u))) {
           throw new Error("Photos de l'arrêt " + s.id + " : le serveur n'a pas l'ensemble envoyé");
         }
-        srv.forEach((sp) => {
-          const lp = local.find((x) => x.dataUrl === sp.data_url);
-          if (lp && lp.id !== sp.id) lp.id = sp.id;
-        });
         okPhotos.add(sid0);
         } catch (e) {
           // v20 : échec ISOLÉ aux photos de CET arrêt — compté,
