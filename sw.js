@@ -2,7 +2,7 @@
    Met l'enveloppe de l'app en cache pour un démarrage rapide et
    un fonctionnement de base hors ligne. Les appels externes
    (Photon, OSRM, Supabase) passent toujours par le réseau. */
-const CACHE = "wl-livraison-v22";
+const CACHE = "wl-livraison-v23";
 const SHELL = [
   "./",
   "./index.html",

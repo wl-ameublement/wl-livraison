@@ -72,20 +72,38 @@
      MODE LOCAL — persistance immédiate + copies automatiques
      ================================================================ */
   function persistLocal() {
-    try { localStorage.setItem(LS_KEY, JSON.stringify(DB)); } catch (e) {
-      // v17 : si le stockage est plein, réessayer SANS les photos
-      // déjà confirmées par le serveur (elles y sont en sécurité) —
-      // seules les photos « sales » (pas encore rendues) restent sur
-      // l'appareil. Avant, l'échec était silencieux et la copie
-      // locale restait figée à un vieil état.
-      try {
-        const light = Object.assign({}, DB, { photos: {} });
-        Object.keys(DB.photos || {}).forEach((sid) => {
-          if (dirtyPhotoStops.has(sid)) light.photos[sid] = DB.photos[sid];
-        });
-        localStorage.setItem(LS_KEY, JSON.stringify(light));
-      } catch (e2) { /* même allégée, ça ne rentre pas : le serveur et les ensembles sales persistés prennent le relais */ }
-      warnQuota(e);
+    const writeLight = () => {
+      const light = Object.assign({}, DB, { photos: {} });
+      Object.keys(DB.photos || {}).forEach((sid) => {
+        if (dirtyPhotoStops.has(sid)) light.photos[sid] = DB.photos[sid];
+      });
+      localStorage.setItem(LS_KEY, JSON.stringify(light));
+    };
+    /* v23 (échelle) : si les photos dépassent à elles seules la
+       capacité locale plausible, la tentative d'écriture complète
+       est vouée au quota — et sa sérialisation (~405 Mo au volume
+       réel) coûte des secondes à CHAQUE sauvegarde. On écrit alors
+       directement la copie allégée : même état final que le repli
+       v17, même avis de stockage. */
+    let photoChars = 0;
+    try {
+      Object.keys(DB.photos || {}).forEach((sid) => {
+        (DB.photos[sid] || []).forEach((p) => { photoChars += (p.dataUrl || "").length; });
+      });
+    } catch (e) { photoChars = 0; }
+    if (photoChars > 4500000) {
+      try { writeLight(); } catch (e2) { /* même allégée, ça ne rentre pas : le serveur et les ensembles sales persistés prennent le relais */ }
+      warnQuota();
+    } else {
+      try { localStorage.setItem(LS_KEY, JSON.stringify(DB)); } catch (e) {
+        // v17 : si le stockage est plein, réessayer SANS les photos
+        // déjà confirmées par le serveur (elles y sont en sécurité) —
+        // seules les photos « sales » (pas encore rendues) restent sur
+        // l'appareil. Avant, l'échec était silencieux et la copie
+        // locale restait figée à un vieil état.
+        try { writeLight(); } catch (e2) { /* même allégée, ça ne rentre pas : le serveur et les ensembles sales persistés prennent le relais */ }
+        warnQuota(e);
+      }
     }
     // Copie de secours automatique, réécrite à chaque changement.
     // v13 : SANS les photos (elles sont dans la copie principale et
@@ -100,7 +118,19 @@
     let snaps = [];
     try { snaps = JSON.parse(localStorage.getItem(LS_SNAPS) || "[]"); } catch (e) { snaps = []; }
     if (snaps.some((s) => s.date === today)) return;
-    const snap = { date: today, at: Date.now(), db: JSON.parse(JSON.stringify(DB)) };
+    /* v23 (échelle) : au-delà du seuil de persistLocal, le clone
+       profond complet est voué au repli « sans photos » de toute
+       façon — on construit directement cet état final, sans payer
+       la sérialisation du volume entier une fois par jour. */
+    let snapPhotoChars = 0;
+    try {
+      Object.keys(DB.photos || {}).forEach((sid) => {
+        (DB.photos[sid] || []).forEach((p) => { snapPhotoChars += (p.dataUrl || "").length; });
+      });
+    } catch (e) { snapPhotoChars = 0; }
+    const snap = snapPhotoChars > 4500000
+      ? { date: today, at: Date.now(), db: Object.assign({}, DB, { photos: {} }), sansPhotos: true }
+      : { date: today, at: Date.now(), db: JSON.parse(JSON.stringify(DB)) };
     snaps.push(snap);
     snaps = snaps.slice(-14); // 14 jours de snapshots
     try {
@@ -463,6 +493,26 @@
     // pourront avancer les empreintes « propres » (voir plus bas).
     const srvDayDateSet = new Set(next.days.map((d) => d.date));
     const srvStopIdSet = new Set(next.stops.map((s) => s.id));
+    // v23 : empreintes du contenu TEL QUE LU du serveur, avant
+    // toute surcouche locale (préservation, rattachement de
+    // photos, propagation de suppression de journée, surcouche
+    // des entités « sales »). refreshCleanFromDB ne certifiera
+    // « propre » que ce qui est resté IDENTIQUE à cette lecture :
+    // une modification locale arrivée PENDANT le rechargement
+    // (invisible dans preDirty, photographié au départ) ne doit
+    // jamais être crue confirmée par le serveur — voir son
+    // commentaire (perte silencieuse prouvée par run26a).
+    const srvDayFPs = new Map(next.days.map((d) => [d.date, dayFP(d)]));
+    const srvDateByDayId2 = {};
+    next.days.forEach((d) => { srvDateByDayId2[d.id] = d.date; });
+    const srvStopFPs = new Map(next.stops.map((s) => {
+      const r = stopRowOf(s, srvDateByDayId2[s.dayId] || s.dayId, null);
+      r.day_id = srvDateByDayId2[s.dayId] || s.dayId || null;
+      r.address_id = s.addressKey || null;
+      r.deleted_at = s.deletedAt || null;
+      return [s.id, JSON.stringify(r)];
+    }));
+    const srvPhotoFPs = new Map(next.stops.map((s) => [s.id, photoFP(next.photos[s.id])]));
     // Préserver ce qui n'existe encore que sur cet appareil (créé hors
     // connexion ou pas encore poussé) : sans ça, le rechargement serveur
     // l'effacerait de l'écran — et de l'appareil — en silence.
@@ -604,7 +654,7 @@
     // absorption. Ensuite seulement, les empreintes des entités
     // venues du serveur et non sales avancent jusqu'à l'état lu.
     recomputeDirty();
-    refreshCleanFromDB(srvDayDateSet, srvStopIdSet, preDirty);
+    refreshCleanFromDB(srvDayDateSet, srvStopIdSet, preDirty, { days: srvDayFPs, stops: srvStopFPs, photos: srvPhotoFPs });
     // La copie locale reflète TOUJOURS la base fusionnée — sinon,
     // au prochain démarrage, une vieille copie locale serait prise
     // pour un changement local et écraserait le serveur.
@@ -734,7 +784,19 @@
     r.deleted_at = s.deletedAt || null;           // comparer en ms des deux côtés
     return JSON.stringify(r);
   }
+  const _hashMemo = new Map(); // v23 : mémo cyrb53 — fonction pure de la chaîne, valeurs inchangées
   function hashStr(str) { // cyrb53 — empreinte courte d'une photo (jamais le base64 lui-même)
+    /* v23 (échelle) : sans mémo, CHAQUE recomputeDirty() — donc
+       chaque sauvegarde — rehachait TOUTES les photos (~405 Mo de
+       dataURL au volume réel de 2 700 arrêts) : démarrage à froid
+       et sauvegardes gelaient proportionnellement au volume total.
+       La mémo (clé = la chaîne elle-même, immuable) rend les
+       rehachages d'une photo inchangée quasi gratuits ; le premier
+       hachage de chaque photo reste payé une seule fois. */
+    if (str && str.length > 4096) {
+      const hit = _hashMemo.get(str);
+      if (hit !== undefined) return hit;
+    }
     let h1 = 0xdeadbeef, h2 = 0x41c6ce57;
     for (let i = 0; i < str.length; i++) {
       const ch = str.charCodeAt(i);
@@ -743,7 +805,9 @@
     }
     h1 = Math.imul(h1 ^ (h1 >>> 16), 2246822507) ^ Math.imul(h2 ^ (h2 >>> 13), 3266489909);
     h2 = Math.imul(h2 ^ (h2 >>> 16), 2246822507) ^ Math.imul(h1 ^ (h1 >>> 13), 3266489909);
-    return (h2 >>> 0).toString(16) + (h1 >>> 0).toString(16) + ":" + str.length;
+    const out = (h2 >>> 0).toString(16) + (h1 >>> 0).toString(16) + ":" + str.length;
+    if (str && str.length > 4096) _hashMemo.set(str, out); // v23
+    return out;
   }
   function photoFP(bucket) {
     return (bucket || []).map((p) => hashStr(p.dataUrl || "")).sort().join(",");
@@ -760,6 +824,7 @@
      mieux vaut tout réécrire une fois que perdre une modification. */
   const LS_SYNC = "wl_livraison_sync_v17";
   let cleanDays = new Map(), cleanStops = new Map(), cleanPhotos = new Map();
+  let freshnessExempt = false; // v23 : posé par importJSON (restauration volontaire) — le garde-fou fraîcheur laisse alors tout passer, un seul cycle
   let dirtyDays = new Set(), dirtyStops = new Set(), dirtyPhotoStops = new Set();
   /* v20 : ISOLATION DES ERREURS + QUARANTAINE (état persisté).
      En v17-v19, la poussée était UN bloc try/catch : la première
@@ -975,7 +1040,7 @@
      l'état que le serveur vient de confirmer par cette lecture).
      Les entités absentes de la lecture (préservées localement) et
      les entités sales gardent leur ancienne empreinte. */
-  function refreshCleanFromDB(srvDayDateSet, srvStopIdSet, preDirty) {
+  function refreshCleanFromDB(srvDayDateSet, srvStopIdSet, preDirty, srvFPs) {
     if (!DB) return;
     // v20 : « non sale » se juge sur les ensembles d'AVANT ce
     // rechargement (preDirty : les vraies modifications locales en
@@ -1009,14 +1074,36 @@
       if (srvStopIdSet && !srvStopIdSet.has(s.id)) return;
       if (!wasDirtyPhoto(s.id)) photoUnknownStops.delete(s.id);
     });
+    // v23 : on ne certifie que ce qui est IDENTIQUE au contenu
+    // lu du serveur (srvFPs, capturé avant la surcouche). Si le
+    // contenu fusionné diffère de la lecture, il porte la
+    // surcouche d'une modification locale arrivée PENDANT ce
+    // rechargement — preDirty, photographié au départ, ne peut
+    // pas la voir, et l'ancienne règle avançait quand même
+    // l'empreinte « propre » jusqu'au contenu local : la
+    // modification était crue CONFIRMÉE alors qu'elle n'avait
+    // jamais été écrite au serveur ; jamais poussée ensuite,
+    // elle était écrasée par le rechargement suivant (perte
+    // silencieuse prouvée par run26a : modification faite
+    // pendant un rechargement en vol, disparue sans trace).
+    // L'entité reste alors « sale » : la poussée qui suit le
+    // rechargement la rendra pour de vrai.
+    const srvDayFPs = srvFPs && srvFPs.days, srvStopFPs = srvFPs && srvFPs.stops, srvPhotoFPs = srvFPs && srvFPs.photos;
     (DB.days || []).forEach((d) => {
       if (srvDayDateSet && !srvDayDateSet.has(d.date)) return;
-      if (!wasDirtyDay(d.date)) { cleanDays.set(d.date, dayFP(d)); dirtyDays.delete(d.date); }
+      if (!wasDirtyDay(d.date)) {
+        if (srvDayFPs && srvDayFPs.has(d.date) && srvDayFPs.get(d.date) !== dayFP(d)) return; // surcouche en vol : ne pas certifier
+        cleanDays.set(d.date, dayFP(d)); dirtyDays.delete(d.date);
+      }
     });
     (DB.stops || []).forEach((s) => {
       if (srvStopIdSet && !srvStopIdSet.has(s.id)) return;
-      if (!wasDirtyStop(s.id)) { cleanStops.set(s.id, stopFP(s)); dirtyStops.delete(s.id); }
-      if (!wasDirtyPhoto(s.id)) { cleanPhotos.set(s.id, photoFP((DB.photos || {})[s.id])); dirtyPhotoStops.delete(s.id); }
+      if (!wasDirtyStop(s.id)) {
+        if (!(srvStopFPs && srvStopFPs.has(s.id) && srvStopFPs.get(s.id) !== stopFP(s))) { cleanStops.set(s.id, stopFP(s)); dirtyStops.delete(s.id); }
+      }
+      if (!wasDirtyPhoto(s.id)) {
+        if (!(srvPhotoFPs && srvPhotoFPs.has(s.id) && srvPhotoFPs.get(s.id) !== photoFP((DB.photos || {})[s.id]))) { cleanPhotos.set(s.id, photoFP((DB.photos || {})[s.id])); dirtyPhotoStops.delete(s.id); }
+      }
     });
     // Oublier les empreintes d'entités disparues de la base.
     const dates = new Set((DB.days || []).map((d) => d.date));
@@ -1209,6 +1296,7 @@
     const okDays = new Set(), okStops = new Set(), okPhotos = new Set();
     const failed = { days: new Set(), stops: new Set(), photos: new Set() };
     const settledByDay = new Set(); // arrêts soldés localement par le garde-fou (règle c)
+    const staleStops = new Set(); // v23 : arrêts bloqués par le garde-fou fraîcheur (voir phase 3)
     let cycleError = null;
     let srvDayDeletedByDate = {};
     try {
@@ -1218,8 +1306,10 @@
       const daysPre = await selectAllPages((a, b) => supa.from("days").select("id,date,deleted_at").range(a, b)); // v22 : paginé
       throwIfError("Lecture des journées", daysPre);
       const srvDayIdByDate = {};
+      const srvDateByDayId = {}; // v23 : inverse — sert au garde-fou fraîcheur (empreinte des lignes serveur)
       (daysPre.data || []).forEach((d) => {
         srvDayIdByDate[d.date] = d.id;
+        srvDateByDayId[d.id] = d.date;
         srvDayDeletedByDate[d.date] = d.deleted_at ? Date.parse(d.deleted_at) : null;
       });
       // v20 : ADOPTION D'ID DE JOURNÉE. Deux fenêtres/appareils qui
@@ -1396,6 +1486,88 @@
         if (window.WL_toast) { try { window.WL_toast("Suppression automatique bloquée : un arrêt a failli partir à la corbeille tout seul."); } catch (e) { /* affichage seulement */ } }
         s.deletedAt = null; // réparation locale : l'arrêt revit et repart vivant ce cycle-ci
       }
+      // v23 : GARDE-FOU FRAÎCHEUR (arrêts vivants) — LE BUG DU
+      // TEST NAVIGATEUR RÉEL v22 (23 nov. 2026, prouvé par run30,
+      // journal des écritures à l'appui) : 6 arrêts sur 63
+      // retrouvés à un état PARTIEL de mi-création (téléphone
+      // « 41 », adresse « 189 ») APRÈS avoir été complétés et
+      // vérifiés. Mécanisme : une fenêtre périmée (onglet resté
+      // ouvert d'une session interrompue, ou état « sale » hérité
+      // au redémarrage) détenait la copie d'avant la complétion ;
+      // sa poussée suivante l'écrivait PAR-DESSUS la version
+      // complète du serveur — la phase 3 ne comparait jamais la
+      // ligne locale à l'état serveur (seule la corbeille avait
+      // un garde-fou) et aucun updated_at n'existe pour départager.
+      // Règle, par arrêt sur le point d'être écrit : relire sa
+      // ligne serveur, reconstruire son empreinte EXACTEMENT
+      // comme le rechargement construit les arrêts (même
+      // conversion, donc empreintes comparables aux empreintes
+      // « propres »), puis —
+      //  · serveur = ce qu'on allait écrire : déjà rendu,
+      //    confirmer SANS écrire ;
+      //  · serveur = l'empreinte « propre » de cette fenêtre
+      //    (sa dernière base confirmée) : rien n'a bougé depuis,
+      //    écrire normalement ;
+      //  · sinon (le serveur a bougé depuis la base de cette
+      //    fenêtre, ou cette fenêtre n'a aucune base) : la
+      //    fenêtre est PÉRIMÉE pour cet arrêt — NE RIEN ÉCRIRE,
+      //    le solder localement et recharger en fin de cycle :
+      //    la version serveur, plus récente, sera adoptée.
+      // Une restauration explicite (importJSON) est exemptée :
+      // geste volontaire qui DOIT pouvoir tout écraser.
+      const exemptFresh = freshnessExempt; freshnessExempt = false;
+      if (!exemptFresh) {
+        const freshCands = workStops.filter((s) => todoStops.has(s.id) && uuidOk(s.id) && !settledByDay.has(s.id) && !s.deletedAt);
+        if (freshCands.length) {
+          const srvStopById = {};
+          for (let i = 0; i < freshCands.length; i += 100) {
+            const chunkIds = freshCands.slice(i, i + 100).map((s) => s.id);
+            const rr = await selectAllPages((a, b) => supa.from("stops").select("*").in("id", chunkIds).range(a, b));
+            throwIfError("Fraîcheur (lecture des arrêts)", rr);
+            (rr.data || []).forEach((r) => { srvStopById[r.id] = r; });
+          }
+          const addrIds = [...new Set(Object.values(srvStopById).map((r) => r.address_id).filter(Boolean))];
+          const srvAddrById = {};
+          if (addrIds.length) {
+            const ra = await selectAllPages((a, b) => supa.from("addresses").select("*").in("id", addrIds).range(a, b));
+            throwIfError("Fraîcheur (lecture des adresses)", ra);
+            (ra.data || []).forEach((r) => { srvAddrById[r.id] = r; });
+          }
+          let toastShown = false;
+          for (const s of freshCands) {
+            const row = srvStopById[s.id];
+            if (!row) continue; // absent du serveur : création normale
+            const a = srvAddrById[row.address_id] || {};
+            const srvLocal = {
+              id: row.id, dayId: row.day_id, position: row.position || 0,
+              address: a.full_address || "", street: a.street || "", city: a.city || "",
+              sector: a.sector || "", postal: a.postal_code || "",
+              lat: a.lat, lng: a.lng, addressKey: a.address_key || "",
+              client: row.client_name || "", apartment: row.apartment || "", apartmentNone: !!row.apartment_none, phone: row.phone || "",
+              vendor: row.vendor_name || "", appliance: row.appliance || "", pieces: row.pieces || 1,
+              installation: !!row.installation, pickup: !!row.pickup,
+              orderPref: row.order_pref || "auto", type: row.type || "livraison",
+              win1s: t2m(row.win1_start), win1e: t2m(row.win1_end),
+              win2s: t2m(row.win2_start), win2e: t2m(row.win2_end),
+              duration: 15, details: row.details || "",
+              delivered: !!row.delivered, failed: !!row.failed,
+              eta: row.eta_min != null ? row.eta_min : null,
+              deletedAt: row.deleted_at ? Date.parse(row.deleted_at) : null
+            };
+            const r = stopRowOf(srvLocal, srvDateByDayId[row.day_id] || row.day_id, null);
+            r.day_id = srvDateByDayId[row.day_id] || row.day_id;
+            r.address_id = srvLocal.addressKey || null;
+            r.deleted_at = srvLocal.deletedAt || null;
+            const srvFP = JSON.stringify(r);
+            if (srvFP === stopFP(s)) { okStops.add(s.id); continue; } // déjà rendu tel quel : confirmer sans écrire
+            const baseFP = cleanStops.get(s.id);
+            if (baseFP !== undefined && srvFP === baseFP) continue; // serveur toujours à ma base : écriture normale
+            staleStops.add(s.id);
+            console.warn("Garde-fou fraîcheur : arrêt modifié ailleurs entre-temps (" + s.id + ", " + (s.client || "") + ") — la version périmée de cette fenêtre n'a PAS été envoyée ; resynchronisation.");
+            if (!toastShown && window.WL_toast) { toastShown = true; try { window.WL_toast("Conflit évité : un arrêt avait été mis à jour ailleurs — cette fenêtre s'est resynchronisée sans rien écraser."); } catch (e) { /* affichage seulement */ } }
+          }
+        }
+      }
       // Lots de 50, VÉRIFIÉS ligne par ligne sur des champs témoins
       // (téléphone, position, eta, corbeille) — v20 : repli
       // individuel + échec isolé, comme pour les journées.
@@ -1405,6 +1577,7 @@
       for (const s of workStops) {
         if (!todoStops.has(s.id)) continue;
         if (settledByDay.has(s.id)) continue; // soldé par le garde-fou (c) : aucune écriture
+        if (staleStops.has(s.id)) continue; // v23 : bloqué par le garde-fou fraîcheur : aucune écriture
         if (s.addressKey && failedAddrKeys.has(s.addressKey)) { failed.stops.add(s.id); noteFailure("stops", s.id); continue; }
         const day = DB.days.find((x) => x.id === s.dayId);
         if (!day || !dayIdByDate[day.date]) { blockedStops.push(s.id); failed.stops.add(s.id); noteFailure("stops", s.id); continue; }
@@ -1478,6 +1651,7 @@
         if (!s) { dirtyPhotoStops.delete(sid0); continue; }
         if (!uuidOk(s.id)) continue; // pas encore d'id serveur : restera sale, repartira après l'insertion de l'arrêt
         if (blockedStops.indexOf(s.id) !== -1) continue; // journée absente du serveur : même sort que l'arrêt (voir étape 3)
+        if (staleStops.has(s.id)) continue; // v23 : fenêtre périmée pour cet arrêt (garde-fou fraîcheur) — ne pas toucher non plus à ses photos
         if (failed.stops.has(sid0) || failed.stops.has(s.id)) continue; // v20 : l'arrêt n'est pas rendu ce cycle-ci — ses photos attendront, sans compter comme un échec photo
         try {
         // v22 : le réimport d'abord s'impose dans DEUX cas —
@@ -1595,6 +1769,16 @@
       const id = adoptedMap[id0] || id0;
       const s = DB.stops.find((x) => x.id === id);
       if (!s) { dirtyStops.delete(id0); dirtyStops.delete(id); return; }
+      if (staleStops.has(id0) || staleStops.has(id)) {
+        // v23 : soldé par le garde-fou fraîcheur — rien n'a été
+        // écrit ; l'arrêt sort des ensembles « sales » SANS que
+        // son empreinte « propre » avance : le rechargement
+        // demandé en fin de cycle adoptera la version serveur et
+        // reconstruira l'empreinte (refreshCleanFromDB).
+        dirtyStops.delete(id0); dirtyStops.delete(id);
+        dirtyPhotoStops.delete(id0); dirtyPhotoStops.delete(id);
+        return;
+      }
       if (settledByDay.has(id0) || settledByDay.has(id)) {
         // Soldé par le garde-fou (c) : aucune écriture serveur,
         // l'état local fait foi tant que la journée est corbeillée
@@ -1634,6 +1818,7 @@
     else if (actionableCount() > 0) { setSyncState("pending"); pushSupabaseSoon(); } // il reste du travail (changé pendant la poussée)
     else if (quarantineCount() > 0) setSyncState("error"); // v20 : quarantaine restante = erreur visible
     else setSyncState("ok");
+    if (staleStops.size) refreshRemote(); // v23 : adopter la version serveur des arrêts bloqués par le garde-fou fraîcheur
     pushSnapshotSupabase(); // v16 : en arrière-plan — ne bloque plus la poussée
   }
 
@@ -1792,7 +1977,7 @@
     recomputeDirty();
     persistLocal();
     persistSyncMeta();
-    if (MODE === "supabase") { setSyncState("pending"); pushSupabaseNow(); }
+    if (MODE === "supabase") { freshnessExempt = true; setSyncState("pending"); pushSupabaseNow(); }
   }
 
   /* ================================================================
