@@ -770,6 +770,17 @@
      rechargement : ce qu'une fusion y a mis n'est jamais tenu
      pour un geste de l'utilisateur. */
   let knownDeletedStops = new Map(), knownDeletedDays = new Map();
+  // v21 : arrêts dont les photos sont INCONNUES de cette session.
+  // Calculé à l'init (voir Store.init) : l'empreinte « propre »
+  // prouve que le serveur détient des photos, mais le seau local
+  // est vide — la copie locale chargée était ALLÉGÉE (quota :
+  // persistLocal n'y garde que les photos des arrêts « sales »).
+  // Pour ces arrêts, un seau vide ne vaut JAMAIS suppression
+  // (recomputeDirty) et la phase photos réimporte d'abord les
+  // photos du serveur (pushCycleLocked). Le drapeau tombe dès
+  // qu'un rechargement relit l'arrêt du serveur
+  // (refreshCleanFromDB) ou que la phase photos l'a complété.
+  let photoUnknownStops = new Set();
   let merging = false; // vrai pendant reloadFromSupabase()
   function persistSyncMeta() {
     try {
@@ -910,6 +921,25 @@
     photoStopIds.forEach((sid) => {
       const fp = photoFP((DB.photos || {})[sid]);
       if (fp === "" && !cleanPhotos.has(sid)) return; // arrêt sans photo jamais poussé : rien à suivre
+      // v21 : un seau local VIDE ne prouve une suppression que
+      // si les photos de l'arrêt sont CONNUES de cette session.
+      // Quand le stockage du téléphone sature (des dizaines de
+      // photos de ~150 Ko dépassent vite les ~5 Mo de
+      // localStorage), persistLocal() écrit sa copie ALLÉGÉE —
+      // photos des seuls arrêts « sales » : au redémarrage, les
+      // photos CONFIRMÉES ont disparu de la copie locale sans
+      // avoir été supprimées. Le test de charge réel v20 l'a
+      // montré, et le harnais l'a prouvé (run27/dbg27, journal
+      // des écritures à l'appui) : sans ce garde-fou, ce filet
+      // déduisait une suppression de CHAQUE seau vidé par la
+      // copie allégée, la poussée EFFAÇAIT les photos du serveur
+      // une à une, et la vérification finale comparait deux
+      // ensembles vides — « ✓ Synchronisé » sur des photos
+      // perdues. Le drapeau photoUnknownStops (posé à l'init,
+      // levé dès que le serveur est relu) distingue les deux
+      // cas ; une vraie suppression — geste fait sur des photos
+      // visibles, donc connues — passe normalement.
+      if (fp === "" && photoUnknownStops.has(sid)) return;
       if (cleanPhotos.get(sid) !== fp) dirtyPhotoStops.add(sid);
     });
     if (!merging) noteTrashTransitions(); // v20 : garde-fou corbeille (jamais pendant une fusion)
@@ -947,6 +977,13 @@
     const wasDirtyDay = (k) => (preDirty ? preDirty.days.has(k) : dirtyDays.has(k));
     const wasDirtyStop = (k) => (preDirty ? preDirty.stops.has(k) : dirtyStops.has(k));
     const wasDirtyPhoto = (k) => (preDirty ? preDirty.photos.has(k) : dirtyPhotoStops.has(k));
+    // v21 : un arrêt relu du serveur et non « sale » (au sens
+    // d'avant la fusion) a de nouveau des photos CONNUES : le
+    // seau fusionné fait foi, le drapeau « inconnu » tombe.
+    (DB.stops || []).forEach((s) => {
+      if (srvStopIdSet && !srvStopIdSet.has(s.id)) return;
+      if (!wasDirtyPhoto(s.id)) photoUnknownStops.delete(s.id);
+    });
     (DB.days || []).forEach((d) => {
       if (srvDayDateSet && !srvDayDateSet.has(d.date)) return;
       if (!wasDirtyDay(d.date)) { cleanDays.set(d.date, dayFP(d)); dirtyDays.delete(d.date); }
@@ -1418,6 +1455,26 @@
         if (blockedStops.indexOf(s.id) !== -1) continue; // journée absente du serveur : même sort que l'arrêt (voir étape 3)
         if (failed.stops.has(sid0) || failed.stops.has(s.id)) continue; // v20 : l'arrêt n'est pas rendu ce cycle-ci — ses photos attendront, sans compter comme un échec photo
         try {
+        if (photoUnknownStops.has(s.id)) {
+          // v21 : arrêt chargé depuis une copie locale ALLÉGÉE
+          // (quota) : ses photos serveur ne sont pas dans le seau
+          // local. Les réimporter AVANT tout calcul — sinon la
+          // phase supprimerait du serveur des photos que
+          // l'utilisateur n'a jamais retirées (bogue du test de
+          // charge v20, prouvé par run27/dbg27). Après l'union,
+          // le seau local fait foi et le drapeau tombe ;
+          // l'empreinte de départ du cycle devient celle du seau
+          // complété pour que le nettoyage de fin de cycle
+          // puisse conclure dès ce cycle-ci.
+          const r0 = await supa.from("photos").select("id,data_url").eq("stop_id", s.id);
+          throwIfError("Photos (réimport copie allégée)", r0);
+          if (!DB.photos) DB.photos = {};
+          const bucket0 = DB.photos[s.id] || (DB.photos[s.id] = []);
+          const haveId = new Set(bucket0.map((p) => p.id));
+          (r0.data || []).forEach((r) => { if (!haveId.has(r.id)) bucket0.push({ id: r.id, dataUrl: r.data_url }); });
+          photoUnknownStops.delete(s.id);
+          fpPhoto0.set(sid0, photoFP(bucket0));
+        }
         const local = DB.photos[s.id] || [];
         const readSrvPhotos = async () => {
           const r = await supa.from("photos").select("id,data_url").eq("stop_id", s.id);
@@ -1546,6 +1603,16 @@
   }
   async function pushSnapshotSupabase() {
     if (!supa) return;
+    // v21 : ne jamais figer un snapshot depuis une copie locale
+    // ALLÉGÉE (quota — voir recomputeDirty) : si le serveur est
+    // connu pour détenir des photos absentes de la copie locale
+    // (empreinte propre non vide, seau vide), le snapshot serait
+    // une « sauvegarde » SANS ces photos — pire que pas de
+    // snapshot, car une restauration depuis lui les perdrait
+    // pour de bon. Le rechargement qui suit réimporte les
+    // photos ; le prochain cycle snapshottera juste.
+    const missingPhotos = [...cleanPhotos.entries()].some(([sid, fp]) => fp && !(((DB || {}).photos || {})[sid] || []).length);
+    if (missingPhotos) return;
     const today = todayISO();
     const now = Date.now();
     // Sauvegarde externe (table backups de Supabase) — règle de William,
@@ -1689,6 +1756,11 @@
       if (MODE === "supabase") {
         loadLocal(); // cache local immédiat (affichage instantané + filet de sécurité)
         loadSyncMeta(); // v17 : ensembles « sales » + empreintes « propres » persistés
+        // v21 : repérer les arrêts « photos inconnues » AVANT le
+        // filet — empreinte propre non vide (le serveur détient
+        // des photos) mais seau local vide (copie allégée, quota).
+        photoUnknownStops = new Set();
+        cleanPhotos.forEach((fp, sid) => { if (fp && !((DB.photos || {})[sid] || []).length) photoUnknownStops.add(sid); });
         recomputeDirty(); // filet : tout écart local/empreinte devient « sale »
         dedupeDays();
         dedupeStops();
